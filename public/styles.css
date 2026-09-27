@@ -1,0 +1,715 @@
+﻿/* Сине-стальная тема. Главный цвет #202d3a остаётся и держит на себе и сцену,
+   и хром: панели уходят в тень от него, а не светлеют.
+
+   Насыщенные цвета объектов сцены в хром не входят: насыщенный цвет в
+   интерфейсе означает геометрию и больше ничего. Поэтому панели монохромны, а
+   акцент - бледная ледяная подсветка. Исключение одно: буквы X, Y, Z в полях
+   координат повторяют цвета осей на сцене, это легенда, а не украшение. */
+/* Geist лежит в public/fonts двумя наборами, латиница и кириллица: браузер
+   тянет только нужный, а не оба сразу. Гарнитура переменная, поэтому вес
+   задаётся осью, и полужирного отдельного файла не требуется. Индексы точек
+   вроде A₁ в начертание не входят и берутся из следующего шрифта в списке. */
+@font-face {
+  font-family: 'Geist';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('fonts/geist-latin-wght-normal.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BC, U+02C6, U+02DA, U+02DC,
+    U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+2013-2014, U+2018-201A,
+    U+201C-201E, U+2022, U+2026, U+2032-2033, U+2039-203A, U+2044, U+20AC, U+2122,
+    U+2191, U+2193, U+2212;
+}
+@font-face {
+  font-family: 'Geist';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('fonts/geist-cyrillic-wght-normal.woff2') format('woff2');
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+
+:root {
+  --bg: #202d3a;
+  --panel: #1a242e;
+  --panel-2: #22303c;
+  --sunken: #141d25;
+  --line: #32424e;
+  --line-2: #46596a;
+  --text: #e6edf3;
+  --muted: #9fb2c1;
+  --ice: #cfe6f2;
+
+  /* Красный появляется только под курсором на разрушающем действии: в покое
+     панель монохромна, иначе «Очистить» и крестик в списке кричали бы сами по
+     себе и спорили бы с цветом геометрии на сцене. */
+  --danger: #e26a5c;
+  --danger-bg: #38242a;
+
+  /* Geist лежит в public/fonts и подключается @font-face выше. Дальше идут
+     системные гарнитуры: без них подпись на сцене и текст в панели поедут
+     разными начертаниями, если файл не успел подгрузиться. */
+  --font-ui: 'Geist', 'Segoe UI', system-ui, sans-serif;
+  --font-num: 'Cascadia Mono', Consolas, monospace;
+  --radius: 2px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-variant-numeric: lining-nums;
+  overflow: hidden;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 252px 1fr 288px;
+  height: 100vh;
+}
+
+.panel {
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  padding: 0 14px 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  scrollbar-color: var(--line-2) transparent;
+}
+
+.panel.right {
+  border-right: none;
+  border-left: 1px solid var(--line);
+}
+
+/* Заголовок панели отделён от инструментов линейкой, как штамп на чертеже. */
+.panel h1 {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  margin: 0 -14px 14px;
+  padding: 14px 14px 11px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+/* Линейки над первой группой нет ни в одной панели: она открывает список, а не
+   продолжает его. */
+.panel > .group:first-of-type {
+  border-top: none;
+}
+
+/* Отступ сверху обнуляется только слева: там над группами уже стоит h1. В правой
+   панели заголовка нет, и без этого первая группа прижимается к краю окна. */
+.panel.left > .group:first-of-type {
+  padding-top: 0;
+}
+
+/* Список объектов занимает всю высоту панели: свойства сверху, кнопка снизу. */
+.group.grow {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Микро-подпись строчными: прописные с разрядкой - привычка тёмных
+   лендингов, а не чертежа. */
+.group-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 1px;
+}
+
+button {
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 7px 9px;
+  text-align: left;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+
+button:hover:not(:disabled) {
+  background: #2a3b49;
+  border-color: var(--line-2);
+}
+
+button:active:not(:disabled) {
+  background: #243440;
+}
+
+button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid var(--ice);
+  outline-offset: 1px;
+}
+
+/* Инструменты - рейка с клавишными колпачками: буква моноширинная и стоит в
+   одной колонке, поэтому названия выравниваются по левому краю. */
+.tools {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.tool {
+  display: grid;
+  grid-template-columns: 20px 1fr;
+  align-items: center;
+  gap: 9px;
+  border-color: transparent;
+  background: transparent;
+}
+
+.tool:hover:not(:disabled) {
+  background: var(--panel-2);
+  border-color: var(--line);
+}
+
+.tool b {
+  font-family: var(--font-num);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+/* Активный инструмент держится тоном и весом, а не цветной полосой. */
+.tool.active {
+  background: #2d3f4d;
+  color: var(--ice);
+}
+
+.tool.active b {
+  color: var(--ice);
+  border-color: var(--line-2);
+}
+
+.action {
+  text-align: center;
+}
+
+/* Переключатели не рвутся посреди фразы: длинная подпись переносит кнопку
+   целиком на следующую строку, а не ломается по слогам. */
+.action.toggle {
+  white-space: nowrap;
+}
+
+.row.toggles {
+  flex-wrap: wrap;
+}
+
+.row.toggles .action {
+  flex: 1 1 auto;
+}
+
+/* Включённый переключатель читается заливкой, а не зелёным: насыщенных
+   цветов в хроме не бывает. */
+.action.toggle.active {
+  background: #33505f;
+  border-color: var(--ice);
+  color: var(--ice);
+}
+
+.action.danger:hover:not(:disabled) {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.row {
+  display: flex;
+  gap: 5px;
+}
+
+.row .action {
+  flex: 1;
+}
+
+.icon {
+  display: block;
+  width: 16px;
+  height: 16px;
+  margin: 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+
+.stage {
+  position: relative;
+  overflow: hidden;
+}
+
+#view {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: crosshair;
+}
+
+.cursor-info {
+  position: absolute;
+  top: 12px;
+  left: 14px;
+  font-family: var(--font-num);
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 4px 8px;
+  pointer-events: none;
+  min-height: 24px;
+}
+
+.cursor-info:empty {
+  display: none;
+}
+
+/* Плашка ввода появляется только когда есть точки: постоянной подсказки в ней
+   больше нет, поэтому в пустом виде она занимала место внизу сцены. */
+.status {
+  position: absolute;
+  right: 14px;
+  bottom: 12px;
+  max-width: calc(100% - 28px);
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 5px 7px;
+  pointer-events: none;
+}
+
+.status.empty {
+  display: none;
+}
+
+.status .pending {
+  display: flex;
+  gap: 5px;
+  font-family: var(--font-num);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* Введённые точки показываются фишками, а не строкой: их число видно сразу. */
+.status .pending:empty {
+  display: none;
+}
+
+.pending .pin {
+  color: var(--ice);
+  background: var(--sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1px 5px;
+}
+
+.flash {
+  position: absolute;
+  top: 48px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-6px);
+  max-width: min(560px, calc(100% - 28px));
+  background: var(--panel);
+  border: 1px solid var(--line-2);
+  border-left: 2px solid var(--ice);
+  color: var(--text);
+  padding: 8px 14px;
+  border-radius: var(--radius);
+  font-size: 12.5px;
+  line-height: 1.45;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s, transform 0.18s;
+}
+
+.flash.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+
+/* Высота задаётся родителем: иначе список обрезался бы на 240px, а панель
+   ниже пустовала. */
+.objects {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.obj {
+  display: grid;
+  grid-template-columns: 8px 1fr auto auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 7px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  background: var(--panel-2);
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+
+/* Строка списка подсвечивается заливкой, а не только рамкой: рамка на два
+   пикселя почти не читается, а строка должна подниматься под курсором
+   целиком. Выбранная строка сохраняет ледяную рамку и меняет только фон. */
+.obj:hover {
+  background: #30465a;
+  border-color: var(--line-2);
+}
+
+.obj.selected:hover {
+  border-color: var(--ice);
+  background: #365064;
+}
+
+.obj.selected {
+  border-color: var(--ice);
+  color: var(--ice);
+}
+
+.obj .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.obj .name {
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.obj .meta {
+  font-family: var(--font-num);
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.mini {
+  padding: 3px;
+  border-color: transparent;
+  background: transparent;
+  border-radius: var(--radius);
+  line-height: 0;
+}
+
+.mini:hover:not(:disabled) {
+  background: #2f4351;
+  border-color: var(--line-2);
+}
+
+/* Скрытый объект: тот же значок, но приглушённый. */
+.mini.off {
+  opacity: 0.4;
+}
+
+.mini.off:hover:not(:disabled) {
+  opacity: 0.8;
+}
+
+.mini.danger:hover:not(:disabled) {
+  color: var(--danger);
+  background: var(--danger-bg);
+  border-color: var(--danger);
+}
+
+/* Пустое состояние без рельсы: вертикальная черта рядом с текстом читалась
+   как обрывок поля, к которому относиться не к чему. */
+.empty {
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+  padding: 1px 0 3px;
+}
+
+/* Карточка свойств не подсвечивается под курсором: она не нажимается, и заливка
+   обещала бы кликабельность, которой нет. Отклик на курсор остаётся у строки
+   списка и у полей, которые с курсором действительно работают. */
+.card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 9px 10px;
+  background: var(--panel-2);
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin-bottom: 7px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field-label {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.inputs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+}
+
+.inputs label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 10px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.inputs input,
+.name-input {
+  font-family: var(--font-num);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  width: 100%;
+  padding: 4px 5px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--sunken);
+  color: var(--text);
+  text-align: center;
+}
+
+.name-input {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  text-align: left;
+}
+
+.inputs input:focus,
+.name-input:focus {
+  outline: none;
+  border-color: var(--ice);
+}
+
+.mini:disabled {
+  opacity: 0.25;
+  cursor: not-allowed;
+}
+
+/* Буквы осей повторяют цвета осей на сцене: это легенда, а не украшение. */
+.inputs .axis-x span {
+  color: #e8747f;
+}
+
+.inputs .axis-y span {
+  color: #7bd88f;
+}
+
+.inputs .axis-z span {
+  color: #6ea8f0;
+}
+
+/* Ямка с нередактируемым текстом: та же рамка, что у полей ввода, иначе
+   уравнение и вершины сечения выглядят как случайные обрывки. */
+.eq {
+  font-family: var(--font-num);
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  color: var(--ice);
+  background: var(--sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 5px 8px;
+  word-break: break-word;
+  line-height: 1.5;
+}
+
+/* Стороны отсечения: у каждой своя точка и своя кнопка, зазор между ними
+   заметный, иначе два блока слипаются в один. */
+.trim {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.trim-side {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+
+.help-dialog {
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  background: var(--panel);
+  color: var(--text);
+  padding: 0;
+  max-width: 620px;
+  width: calc(100% - 32px);
+  max-height: 82vh;
+  overflow-y: auto;
+}
+
+.help-dialog::backdrop {
+  background: rgba(12, 18, 24, 0.78);
+}
+
+.help-head {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.help-head h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.help-head .action {
+  padding: 4px 12px;
+}
+
+/* Управление разложено на термин и описание: инструмент читается в колонке
+   слева, приём работы - в колонке справа. */
+.help {
+  margin: 0;
+  padding: 4px 16px 16px;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.help > div {
+  display: grid;
+  grid-template-columns: 104px 1fr;
+  gap: 14px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.help > div:last-child {
+  border-bottom: none;
+}
+
+.help dt {
+  color: var(--ice);
+  font-weight: 600;
+}
+
+.help dd {
+  margin: 0;
+  color: var(--muted);
+}
+
+.help .key {
+  font-family: var(--font-num);
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+@media (max-width: 1180px) {
+  .app {
+    grid-template-columns: 220px 1fr 252px;
+  }
+}
+
+/* На узком экране панели уходят под сцену: инструменты и список объектов
+   должны остаться доступными, а не выдавливаться за край. */
+@media (max-width: 900px) {
+  html,
+  body {
+    overflow: auto;
+  }
+
+  .app {
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas: 'stage stage' 'left right';
+    height: auto;
+    min-height: 100vh;
+  }
+
+  .stage {
+    grid-area: stage;
+    height: 58vh;
+  }
+
+  .panel.left {
+    grid-area: left;
+  }
+
+  .panel.right {
+    grid-area: right;
+    border-left: none;
+  }
+
+  .panel {
+    overflow-y: visible;
+  }
+
+  .group.grow,
+  .objects {
+    flex: none;
+    overflow-y: visible;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button,
+  .obj,
+  .flash {
+    transition: none;
+  }
+}
+

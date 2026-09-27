@@ -1,0 +1,19 @@
+{
+  "name": "section-builder",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build ./public/src/main.ts --outfile ./public/dist/app.js --target browser --minify",
+    "start": "bun run build && bun run server.ts",
+    "dev": "bun run build && bun run --hot server.ts"
+  },
+  "dependencies": {
+    "three": "^0.180.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/three": "^0.180.0",
+    "puppeteer": "^25.12.0"
+  }
+}
