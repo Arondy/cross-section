@@ -1,4 +1,13 @@
-import { eq, type Plane, type Trims, type Vec3 } from './geometry';
+import {
+  DEFAULT_SOLID,
+  SOLIDS,
+  eq,
+  type Plane,
+  type Solid,
+  type SolidId,
+  type Trims,
+  type Vec3,
+} from './geometry';
 import { COLOR, cssColor } from './colors';
 
 export type Tool = 'select' | 'point' | 'line' | 'segment' | 'plane' | 'trim';
@@ -9,8 +18,8 @@ export interface BaseObj {
   color: string;
   visible: boolean;
   /**
-   * Угловые точки куба. Их нельзя удалить, перетащить и сдвинуть. Имена у них
-   * свои, из `CORNER_POINTS`, поэтому пользовательские точки начинаются с E и не
+   * Угловые точки фигуры. Их нельзя удалить, перетащить и сдвинуть. Имена у них
+   * свои, из углов фигуры, поэтому пользовательские точки начинаются с E и не
    * занимают буквы углов.
    */
   fixed?: boolean;
@@ -58,6 +67,12 @@ export interface PlaneObj extends BaseObj {
 export type SceneObj = PointObj | LineObj | SegmentObj | PlaneObj;
 
 export interface Doc {
+  /**
+   * Фигура сцены. Лежит в документе, а не в состоянии инструментов: смена
+   * фигуры должна отменяться вместе с остальными правками, иначе Ctrl+Z
+   * вернул бы чертёж, которого на экране уже нет.
+   */
+  solid: SolidId;
   objects: SceneObj[];
 }
 
@@ -67,7 +82,7 @@ export function nextId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${counter.toString(36)}`;
 }
 
-// Углы куба занимают A, B, C, D, поэтому пользовательские точки
+// Углы фигуры занимают A, B, C, D, поэтому пользовательские точки
 // продолжают с E. Прямые идут строчными a, b, c - так же, как их принято
 // обозначать в тетради по стереометрии. Отрезки и плоскости именуются по
 // своим точкам, см. `uniqueName`.
@@ -93,7 +108,7 @@ function nextFreeName(doc: Doc, letters: string[]): string {
   }
 }
 
-/** Имя новой точки по алфавиту, начиная с E: углы куба занимают A, B, C, D. */
+/** Имя новой точки по алфавиту, начиная с E: углы фигуры занимают A, B, C, D. */
 export function nextPointName(doc: Doc): string {
   return nextFreeName(doc, POINT_LETTERS);
 }
@@ -125,8 +140,8 @@ export function makePoint(
 ): PointObj {
   return {
     id: nextId('pt'),
-    // Угол куба приходит со своим именем из `CORNER_POINTS`, иначе он получил
-    // бы букву из пользовательского алфавита и занял её.
+    // Угол фигуры приходит со своим именем из её нотации, иначе он получил бы
+    // букву из пользовательского алфавита и занял её.
     name: opts.name ?? nextPointName(doc),
     color: cssColor(COLOR.point),
     visible: true,
@@ -138,26 +153,15 @@ export function makePoint(
 }
 
 /**
- * Углы куба в стандартной нотации ABCDA₁B₁C₁D₁: ABCD лежат в основании
- * y = −1 по кругу против часовой стрелки, точки с индексом 1 — те же углы
- * на верхней грани y = +1.
+ * Углы фигуры её же нотацией: у параллелепипеда ABCDA₁B₁C₁D₁, у тетраэдра
+ * ABCD. Имена берутся из фигуры, поэтому смена фигуры не требует второго
+ * списка углов, а буквы у всех фигур одни и те же - пользовательские точки
+ * начинаются с E при любой из них.
  */
-export const CORNER_POINTS: { name: string; p: Vec3 }[] = [
-  { name: 'A', p: { x: -1, y: -1, z: -1 } },
-  { name: 'B', p: { x: 1, y: -1, z: -1 } },
-  { name: 'C', p: { x: 1, y: -1, z: 1 } },
-  { name: 'D', p: { x: -1, y: -1, z: 1 } },
-  { name: 'A₁', p: { x: -1, y: 1, z: -1 } },
-  { name: 'B₁', p: { x: 1, y: 1, z: -1 } },
-  { name: 'C₁', p: { x: 1, y: 1, z: 1 } },
-  { name: 'D₁', p: { x: -1, y: 1, z: 1 } },
-];
-
-/** Добавляет восемь углов куба, если их ещё нет. */
-export function addCorners(doc: Doc): void {
-  if (doc.objects.some((o) => o.fixed)) return;
-  for (const c of CORNER_POINTS) {
-    doc.objects.push(makePoint(doc, c.p, null, { name: c.name, fixed: true }));
+export function addCorners(doc: Doc, solid: Solid): void {
+  for (const c of solid.corners) {
+    const p = solid.vertices[c.index];
+    doc.objects.push(makePoint(doc, p, null, { name: c.name, fixed: true }));
   }
 }
 
@@ -225,11 +229,16 @@ export function makePlane(
 type Listener = (doc: Doc) => void;
 
 export class Store {
-  doc: Doc = { objects: [] };
+  doc: Doc = { solid: DEFAULT_SOLID, objects: [] };
   selection: string[] = [];
   private undoStack: Doc[] = [];
   private redoStack: Doc[] = [];
   private listeners = new Set<Listener>();
+
+  /** Фигура текущего документа: геометрия всегда берётся отсюда. */
+  get solid(): Solid {
+    return SOLIDS[this.doc.solid];
+  }
 
   subscribe(fn: Listener): () => void {
     this.listeners.add(fn);
@@ -281,7 +290,23 @@ export class Store {
     );
   }
 
-  /** Удаляет объекты. Угловые точки куба защищены и остаются на месте. */
+  /**
+   * Смена фигуры. Чертёж прежней фигуры не переносится: у другой фигуры другие
+   * грани и рёбра, и тот же сегмент или плоскость потеряли бы смысл. Всё
+   * меняется одним `commit`, иначе отмена вернула бы куб с точками
+   * параллелепипеда.
+   */
+  setSolid(id: SolidId): void {
+    if (id === this.doc.solid) return;
+    this.commit((d) => {
+      d.solid = id;
+      d.objects = [];
+      addCorners(d, SOLIDS[id]);
+    });
+    this.selection = [];
+  }
+
+  /** Удаляет объекты. Угловые точки фигуры защищены и остаются на месте. */
   remove(ids: string[]): void {
     this.commit((d) => {
       // Условие в filter описывает, что ОСТАЁТСЯ, поэтому удаляемые объекты
@@ -292,16 +317,16 @@ export class Store {
   }
 
   /**
-   * Есть ли на сцене что-то, кроме углов куба.
+   * Есть ли на сцене что-то, кроме углов фигуры.
    *
    * Углы помечены `fixed` и переживают очистку, поэтому длина `objects` всегда
-   * восемь: по ней нельзя понять, есть ли что стирать.
+   * равна числу углов: по ней нельзя понять, есть ли что стирать.
    */
   hasContent(): boolean {
     return this.doc.objects.some((o) => !o.fixed);
   }
 
-  /** Полная очистка сцены. Угловые точки куба остаются. */
+  /** Полная очистка сцены. Угловые точки фигуры остаются. */
   clear(): void {
     this.commit((d) => {
       d.objects = d.objects.filter((o) => o.fixed);

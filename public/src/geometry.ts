@@ -33,35 +33,185 @@ export function fmt(p: Vec3, digits = 3): string {
   return `(${r(p.x)}, ${r(p.y)}, ${r(p.z)})`;
 }
 
-export const HALF = 1;
+export type SolidId = 'cube' | 'tetra' | 'box' | 'slant';
 
-export const VERTICES: Vec3[] = [];
-for (const x of [-HALF, HALF])
-  for (const y of [-HALF, HALF])
-    for (const z of [-HALF, HALF]) VERTICES.push(v3(x, y, z));
+export const DEFAULT_SOLID: SolidId = 'cube';
 
-// Квад грани обязан лежать в её же плоскости: иначе подсветка горит на одной
-// грани, а куб нарисован на другой. Порядок вершин идёт по кругу, иначе
-// треугольники сложатся в «бабочку».
-export const FACES: { normal: Vec3; quad: number[] }[] = [
-  { normal: v3(0, 0, 1), quad: [1, 3, 7, 5] },
-  { normal: v3(0, 0, -1), quad: [0, 2, 6, 4] },
-  { normal: v3(0, 1, 0), quad: [2, 3, 7, 6] },
-  { normal: v3(0, -1, 0), quad: [0, 1, 5, 4] },
-  { normal: v3(1, 0, 0), quad: [4, 5, 7, 6] },
-  { normal: v3(-1, 0, 0), quad: [0, 1, 3, 2] },
+/**
+ * Грань: плоскость и вершины по кругу.
+ *
+ * Обход вершин идёт против часовой стрелки, если смотреть на грань снаружи, и
+ * прижимание точки к грани считает именно по нему. Направление выводится в
+ * `makeSolid`, а не пишется руками: у наклонных граней оно на глаз всегда
+ * получается не тем, и грань подсвечивалась бы не с той стороны.
+ */
+export interface SolidFace {
+  /** Подпись грани в сообщениях: `x = +1.4` у параллелепипеда, `ABD` у тетраэдра. */
+  name: string;
+  /** Нормаль наружу: вершины грани лежат в плоскости `dot(normal, p) = d`. */
+  normal: Vec3;
+  d: number;
+  poly: number[];
+}
+
+export interface Solid {
+  id: SolidId;
+  vertices: Vec3[];
+  faces: SolidFace[];
+  /** Рёбра: пары индексов вершин, каждое по одному разу. */
+  edges: [number, number][];
+  /** Углы фигуры: имя и индекс вершины. */
+  corners: { name: string; index: number }[];
+}
+
+/**
+ * Фигура собирается из вершин и граней, а нормали и рёбра выводятся из них.
+ *
+ * Нормаль берётся из первых трёх вершин грани и разворачивается наружу от
+ * центра фигуры, обход доворачивается до правильного. Так грань не может
+ * оказаться в плоскости другой грани или с вывернутой вершиной - у куба обе
+ * ошибки выглядели одинаково: подсветка горела не там, чертёж был верный.
+ * Рёбер отдельно нет: они идут по кругу граней, иначе список рёбер разошёлся
+ * бы с набором граней.
+ */
+function makeSolid(
+  id: SolidId,
+  vertices: Vec3[],
+  specs: { name: string; poly: number[] }[],
+  corners: { name: string; index: number }[]
+): Solid {
+  const center = mul(
+    vertices.reduce((s, p) => add(s, p), v3(0, 0, 0)),
+    1 / vertices.length
+  );
+  const faces: SolidFace[] = specs.map((spec) => {
+    const [a, b, c] = spec.poly;
+    const winding = norm(cross(sub(vertices[b], vertices[a]), sub(vertices[c], vertices[a])));
+    if (!winding) throw new Error(`Грань ${spec.name} вырождена: вершины лежат на одной прямой`);
+    const inward = dot(winding, sub(vertices[a], center)) < 0;
+    const normal = inward ? mul(winding, -1) : winding;
+    return {
+      name: spec.name,
+      normal,
+      d: dot(normal, vertices[a]),
+      poly: inward ? spec.poly.slice().reverse() : spec.poly,
+    };
+  });
+  const edges: [number, number][] = [];
+  for (const face of faces) {
+    face.poly.forEach((i, k) => {
+      const j = face.poly[(k + 1) % face.poly.length];
+      const pair: [number, number] = i < j ? [i, j] : [j, i];
+      if (!edges.some(([x, y]) => x === pair[0] && y === pair[1])) edges.push(pair);
+    });
+  }
+  return { id, vertices, faces, edges, corners };
+}
+
+/**
+ * Раскладка вершин параллелепипеда. Индекс кодирует, какие из трёх рёбер уже
+ * добавлены к A, поэтому он не совпадает с порядком букв: 0 = A, 1 = D,
+ * 2 = A₁, 3 = D₁, 4 = B, 5 = C, 6 = B₁, 7 = C₁.
+ */
+const BOX_FACES: { axis: 0 | 1 | 2; side: 0 | 1; poly: number[] }[] = [
+  { axis: 1, side: 0, poly: [0, 4, 5, 1] }, // ABCD
+  { axis: 1, side: 1, poly: [2, 6, 7, 3] }, // A₁B₁C₁D₁
+  { axis: 0, side: 0, poly: [0, 4, 6, 2] }, // ABB₁A₁
+  { axis: 0, side: 1, poly: [4, 5, 7, 6] }, // BCC₁B₁
+  { axis: 2, side: 0, poly: [1, 0, 2, 3] }, // DAA₁D₁
+  { axis: 2, side: 1, poly: [5, 1, 3, 7] }, // CDD₁C₁
 ];
 
-export const FACE_NAMES = ['z = +1', 'z = −1', 'y = +1', 'y = −1', 'x = +1', 'x = −1'];
+const BOX_LETTERS = ['A', 'D', 'A₁', 'D₁', 'B', 'C', 'B₁', 'C₁'];
 
-export const EDGES: [number, number][] = [];
-for (let i = 0; i < 8; i++)
-  for (let j = i + 1; j < 8; j++) {
-    const dx = VERTICES[i].x !== VERTICES[j].x ? 1 : 0;
-    const dy = VERTICES[i].y !== VERTICES[j].y ? 1 : 0;
-    const dz = VERTICES[i].z !== VERTICES[j].z ? 1 : 0;
-    if (dx + dy + dz === 1) EDGES.push([i, j]);
+/** Подпись грани прямоугольного параллелепипеда: `x = +1.4`. */
+const axisFace = (halves: Vec3) => (_letters: string, axis: 0 | 1 | 2, side: 0 | 1): string =>
+  `${'xyz'[axis]} = ${side ? '+' : '−'}${axis === 0 ? halves.x : axis === 1 ? halves.y : halves.z}`;
+
+/** Подпись грани наклонного параллелепипеда: четыре буквы её вершин. */
+const letterFace = (letters: string): string => letters;
+
+/**
+ * Параллелепипед из трёх рёбер, выходящих из A. Куб и прямоугольный
+ * параллелепипед - частные случаи, отличаются только рёбрами, поэтому правила
+ * сечения у них общие по построению, а не по совпадению.
+ */
+function parallelepiped(
+  id: SolidId,
+  origin: Vec3,
+  u: Vec3,
+  v: Vec3,
+  w: Vec3,
+  faceName: (letters: string, axis: 0 | 1 | 2, side: 0 | 1) => string
+): Solid {
+  const vertices: Vec3[] = [];
+  for (let i = 0; i < 8; i++) {
+    let p = clone(origin);
+    if (i & 4) p = add(p, u);
+    if (i & 2) p = add(p, v);
+    if (i & 1) p = add(p, w);
+    vertices.push(p);
   }
+  return makeSolid(
+    id,
+    vertices,
+    BOX_FACES.map((f) => ({
+      name: faceName(f.poly.map((i) => BOX_LETTERS[i]).join(''), f.axis, f.side),
+      poly: f.poly,
+    })),
+    BOX_LETTERS.map((name, index) => ({ name, index }))
+  );
+}
+
+/** Правильный тетраэдр, вписанный в куб: рёбра те же, что у куба. */
+const TETRA_L = 1 / Math.SQRT2;
+
+const TETRA_CORNERS: { name: string; p: Vec3 }[] = [
+  { name: 'A', p: v3(TETRA_L, TETRA_L, TETRA_L) },
+  { name: 'B', p: v3(TETRA_L, -TETRA_L, -TETRA_L) },
+  { name: 'C', p: v3(-TETRA_L, TETRA_L, -TETRA_L) },
+  { name: 'D', p: v3(-TETRA_L, -TETRA_L, TETRA_L) },
+];
+
+export const SOLIDS: Record<SolidId, Solid> = {
+  cube: parallelepiped(
+    'cube',
+    v3(-1, -1, -1),
+    v3(2, 0, 0),
+    v3(0, 2, 0),
+    v3(0, 0, 2),
+    axisFace(v3(1, 1, 1))
+  ),
+  box: parallelepiped(
+    'box',
+    v3(-1, -0.6, -1.2),
+    v3(2, 0, 0),
+    v3(0, 1.2, 0),
+    v3(0, 0, 2.4),
+    axisFace(v3(1, 0.6, 1.2))
+  ),
+  // Наклонный параллелепипед проверяет, что правила не завязаны на грани,
+  // параллельные осям: его боковые грани стоят под углом ко всем трём.
+  slant: parallelepiped(
+    'slant',
+    v3(-1, -0.7, -1.1),
+    v3(2, 0, 0),
+    v3(0.6, 1.4, 0),
+    v3(0, 0, 2.2),
+    letterFace
+  ),
+  tetra: makeSolid(
+    'tetra',
+    TETRA_CORNERS.map((c) => c.p),
+    [
+      { name: 'ABC', poly: [0, 1, 2] },
+      { name: 'ABD', poly: [0, 1, 3] },
+      { name: 'ACD', poly: [0, 2, 3] },
+      { name: 'BCD', poly: [1, 2, 3] },
+    ],
+    TETRA_CORNERS.map((c, index) => ({ name: c.name, index }))
+  ),
+};
 
 export interface Plane {
   n: Vec3;
@@ -119,7 +269,7 @@ export interface HalfSpace {
 /**
  * Отрезок прямой, попадающий внутрь всех полупространств, то есть её часть
  * внутри пирамиды камеры. Прямая рисуется и прилипает по этому отрезку, а не
- * по хорде куба: иначе она обрывается там, где до края экрана ещё далеко,
+ * по хорде фигуры: иначе она обрывается там, где до края экрана ещё далеко,
  * и пересечение двух прямых нельзя ни увидеть, ни построить в нём точку.
  *
  * Параметр t отсчитывается вдоль единичного направления l.dir, поэтому его
@@ -151,71 +301,94 @@ export function lineChordInHalfspaces(
 }
 
 /**
- * Все грани куба, на которых лежит точка. Точка на ребре принадлежит двум
- * граням, вершина - трём, поэтому одиночного индекса для проверки соседей не
- * хватает: цепочку сечения можно вести через ребро, и обе грани на счётчике.
+ * Все грани фигуры, на которых лежит точка. Точка на ребре принадлежит двум
+ * граням, вершина - трём и более, поэтому одиночного индекса для проверки
+ * соседей не хватает: цепочку сечения можно вести через ребро, и обе грани на
+ * счётчике.
  *
- * Проверяется куб целиком, как в `faceOf`: точка в плоскости грани, но за её
+ * Проверяется вся фигура, как в `faceOf`: точка в плоскости грани, но за её
  * краем, ни на какой грани не лежит, иначе цепочка приняла бы её соседом.
  */
-export function pointFaces(p: Vec3, eps = 1e-4): number[] {
-  if (!insideCube(p, eps)) return [];
+export function pointFaces(solid: Solid, p: Vec3, eps = 1e-4): number[] {
+  if (!insideSolid(solid, p, eps)) return [];
   const out: number[] = [];
-  for (let i = 0; i < 6; i++) if (Math.abs(dot(FACES[i].normal, p) - HALF) < eps) out.push(i);
+  for (let i = 0; i < solid.faces.length; i++) {
+    const f = solid.faces[i];
+    if (Math.abs(dot(f.normal, p) - f.d) < eps) out.push(i);
+  }
   return out;
 }
 
 /**
- * Грань куба, на которой лежит точка, или `null` вне граней.
+ * Грань фигуры, на которой лежит точка, или `null` вне граней.
  *
- * Проверяется куб целиком, а не одна плоскость грани: точка на прямой, ушедшей
- * за пределы куба, лежит в плоскости грани и за её краем, и такая подсветка
+ * Проверяется вся фигура, а не одна плоскость грани: точка на прямой, ушедшей
+ * за пределы фигуры, лежит в плоскости грани и за её краем, и такая подсветка
  * вводила бы в заблуждение - точка стоит в стороне, а горит не та грань.
  *
- * Индекс приводится к `null` прямо здесь, на границе модуля: `FACES[-1].normal`
+ * Индекс приводится к `null` прямо здесь, на границе модуля: `faces[-1].normal`
  * уронил бы обработчик превью вместе со всей отрисовкой.
  */
-export function faceOf(p: Vec3, eps = 1e-4): number | null {
-  if (!insideCube(p, eps)) return null;
-  for (let i = 0; i < 6; i++) if (Math.abs(dot(FACES[i].normal, p) - HALF) < eps) return i;
+export function faceOf(solid: Solid, p: Vec3, eps = 1e-4): number | null {
+  if (!insideSolid(solid, p, eps)) return null;
+  for (let i = 0; i < solid.faces.length; i++) {
+    const f = solid.faces[i];
+    if (Math.abs(dot(f.normal, p) - f.d) < eps) return i;
+  }
   return null;
 }
 
 /**
- * Внутри ли точка куба, включая грани, рёбра и вершины.
+ * Внутри ли точка фигуры, включая грани, рёбра и вершины.
  *
- * `faceOf` проверяет куб, а не только плоскость грани, поэтому признак
- * «касается ли куба» и признак «лежит ли на грани» у них совпадают.
+ * Проверяются все грани, а не координаты по модулю: у наклонного
+ * параллелепипеда и тетраэдра грани стоят под углом к осям, и половина
+ * «минус один» для них ничего не значит.
  */
-export function insideCube(p: Vec3, eps = 1e-4): boolean {
-  return (
-    Math.abs(p.x) <= HALF + eps &&
-    Math.abs(p.y) <= HALF + eps &&
-    Math.abs(p.z) <= HALF + eps
-  );
+export function insideSolid(solid: Solid, p: Vec3, eps = 1e-4): boolean {
+  return solid.faces.every((f) => dot(f.normal, p) - f.d <= eps);
 }
 
-export function projectToFaceQuad(p: Vec3, faceIndex: number): Vec3 {
-  const n = FACES[faceIndex].normal;
-  const q = v3(p.x, p.y, p.z);
-  if (n.x !== 0) q.x = HALF * Math.sign(n.x);
-  else if (n.y !== 0) q.y = HALF * Math.sign(n.y);
-  else q.z = HALF * Math.sign(n.z);
-  q.x = Math.max(-HALF, Math.min(HALF, q.x));
-  q.y = Math.max(-HALF, Math.min(HALF, q.y));
-  q.z = Math.max(-HALF, Math.min(HALF, q.z));
+/**
+ * Ближайшая точка грани: сначала ортогональная проекция на её плоскость,
+ * затем прижимание внутрь многоугольника.
+ *
+ * Прижимание идёт по сторонам грани, а не по координатам: у тетраэдра грань -
+ * треугольник, и зажим по осям уводил бы точку за его пределы. Стороны
+ * полупространствами, поэтому несколько проходов сходятся к грани целиком.
+ */
+export function projectToFace(solid: Solid, p: Vec3, faceIndex: number): Vec3 {
+  const f = solid.faces[faceIndex];
+  let q = sub(p, mul(f.normal, dot(f.normal, p) - f.d));
+  for (let pass = 0; pass < f.poly.length; pass++) {
+    let moved = false;
+    for (let i = 0; i < f.poly.length; i++) {
+      const a = solid.vertices[f.poly[i]];
+      const b = solid.vertices[f.poly[(i + 1) % f.poly.length]];
+      // Внутренняя нормаль стороны лежит в плоскости грани: наружу от неё
+      // уходит только сама грань, поэтому знак берётся из обхода вершин.
+      const inward = norm(cross(f.normal, sub(b, a)));
+      if (!inward) continue;
+      const out = dot(inward, sub(q, a));
+      if (out >= 0) continue;
+      q = sub(q, mul(inward, out));
+      moved = true;
+    }
+    if (!moved) break;
+  }
   return q;
 }
 
 export type SnapKind = 'none' | 'edge' | 'vertex';
 
-export function snapToCube(
+export function snapToSolid(
+  solid: Solid,
   p: Vec3,
   threshold = 0.14
 ): { p: Vec3; kind: SnapKind } {
   let best: Vec3 | null = null;
   let bestD = threshold;
-  for (const vertex of VERTICES) {
+  for (const vertex of solid.vertices) {
     const d = dist(p, vertex);
     if (d < bestD) {
       bestD = d;
@@ -224,9 +397,9 @@ export function snapToCube(
   }
   if (best) return { p: clone(best), kind: 'vertex' };
 
-  for (const [i, j] of EDGES) {
-    const a = VERTICES[i];
-    const b = VERTICES[j];
+  for (const [i, j] of solid.edges) {
+    const a = solid.vertices[i];
+    const b = solid.vertices[j];
     const ab = sub(b, a);
     const t = Math.max(0, Math.min(1, dot(sub(p, a), ab) / dot(ab, ab)));
     const proj = add(a, mul(ab, t));
@@ -241,19 +414,19 @@ export function snapToCube(
 }
 
 /**
- * Добавляет точку, если рядом такой же точки ещё нет. Одна вершина куба лежит
- * сразу на нескольких рёбрах, поэтому без проверки сечение насчитало бы лишние
- * вершины.
+ * Добавляет точку, если рядом такой же точки ещё нет. Одна вершина фигуры
+ * лежит сразу на нескольких рёбрах, поэтому без проверки сечение насчитало бы
+ * лишние вершины.
  */
 function pushUnique(out: Vec3[], p: Vec3): void {
   if (!out.some((q) => eq(p, q, 1e-5))) out.push(p);
 }
 
-export function planeEdgePoints(pl: Plane): Vec3[] {
+export function planeEdgePoints(solid: Solid, pl: Plane): Vec3[] {
   const found: Vec3[] = [];
-  for (const [i, j] of EDGES) {
-    const a = VERTICES[i];
-    const b = VERTICES[j];
+  for (const [i, j] of solid.edges) {
+    const a = solid.vertices[i];
+    const b = solid.vertices[j];
     const fa = planeSigned(pl, a);
     const fb = planeSigned(pl, b);
     if (Math.abs(fa) < 1e-9) found.push(clone(a));
@@ -284,8 +457,8 @@ export function planeAxes(pl: Plane): { u: Vec3; w: Vec3 } {
   return { u, w: cross(pl.n, u) };
 }
 
-export function sectionPolygon(pl: Plane): Vec3[] {
-  const pts = planeEdgePoints(pl);
+export function sectionPolygon(solid: Solid, pl: Plane): Vec3[] {
+  const pts = planeEdgePoints(solid, pl);
   if (pts.length < 3) return [];
   const c = mul(
     pts.reduce((s, p) => add(s, p), v3(0, 0, 0)),
@@ -374,7 +547,7 @@ export function lineIntersect(l1: Line3, l2: Line3): Vec3 | null {
  *
  * Отличается от `lineIntersect` проверкой принадлежности: прямая, пересекающая
  * продолжение ребра, с ребром не пересекается. На этом стоит прилипание к
- * ребру куба - без него точка на прямой у края не находила бы общую грань и
+ * ребру фигуры - без него точка на прямой у края не находила бы общую грань и
  * цепочка сечения не замыкалась бы.
  *
  * Проверяется сама точка, а не параметр вдоль ребра. Формулы для `t` и `s`
@@ -396,17 +569,17 @@ export function lineSegmentHit(l: Line3, a: Vec3, b: Vec3): Vec3 | null {
 
 /**
  * Границы того, что отсекать нельзя: отрезок между опорными точками прямой и
- * хорда куба, если прямая через него проходит. За этими границами начинаются
+ * хорда фигуры, если прямая через него проходит. За этими границами начинаются
  * хвосты, и только они отсекаются.
  */
-function untrimmable(l: Line3, b: Vec3): [number, number] {
+function untrimmable(solid: Solid, l: Line3, b: Vec3): [number, number] {
   const t = (p: Vec3) => dot(sub(p, l.p), l.dir);
   // Точка `b` не обязана лежать на параметре 1: параметр вдоль прямой измерен в
   // единицах длины, поэтому конец - это |b − a|. Считать его единицей нельзя,
   // иначе ядро перестаёт содержать `b` и отсечение отрезает её от прямой.
   let lo = 0;
   let hi = t(b);
-  const hits = lineEdgeHits(l);
+  const hits = lineEdgeHits(solid, l);
   if (hits.length >= 2) {
     // Крайние точки хорды: у прямой вдоль ребра или в плоскости грани
     // пересечений больше двух, и берутся только самые дальние.
@@ -428,12 +601,16 @@ function untrimmable(l: Line3, b: Vec3): [number, number] {
  * в сторону от ядра: `min` для начала, `max` для конца. Точка снаружи режет
  * ровно по себе, а точка внутри ядра оставляет отрезок нетронутым.
  */
-export function trimmedSpan(base: [Vec3, Vec3], cut?: Cut): [Vec3, Vec3] {
+export function trimmedSpan(
+  solid: Solid,
+  base: [Vec3, Vec3],
+  cut?: Cut
+): [Vec3, Vec3] {
   if (!cut?.trim) return base;
   const l = lineFromPoints(cut.a, cut.b);
   if (!l) return base;
   const t = (p: Vec3) => dot(sub(p, l.p), l.dir);
-  const [lo, hi] = untrimmable(l, cut.b);
+  const [lo, hi] = untrimmable(solid, l, cut.b);
   const start = cut.trim.start ? Math.min(lo, t(cut.trim.start)) : Math.min(lo, t(base[0]));
   const end = cut.trim.end ? Math.max(hi, t(cut.trim.end)) : Math.max(hi, t(base[1]));
   return [add(l.p, mul(l.dir, start)), add(l.p, mul(l.dir, end))];
@@ -443,14 +620,28 @@ export function trimmedSpan(base: [Vec3, Vec3], cut?: Cut): [Vec3, Vec3] {
  * С какой стороны прямой лежит точка: за началом, перед концом или между ними.
  * Определяет, какое из двух отсечений ей соответствует.
  */
-export function trimEndOf(a: Vec3, b: Vec3, p: Vec3): TrimEnd | 'inside' {
+export function trimEndOf(
+  solid: Solid,
+  a: Vec3,
+  b: Vec3,
+  p: Vec3
+): TrimEnd | 'inside' {
   const l = lineFromPoints(a, b);
   if (!l) return 'inside';
   const t = dot(sub(p, l.p), l.dir);
-  const [lo, hi] = untrimmable(l, b);
+  const [lo, hi] = untrimmable(solid, l, b);
   if (t <= lo) return 'start';
   if (t >= hi) return 'end';
   return 'inside';
+}
+
+/** Расстояние от точки до отрезка: то же, что `pointOnSegment`, но числом. */
+export function distPointSegment(p: Vec3, a: Vec3, b: Vec3): number {
+  const u = sub(b, a);
+  const uu = dot(u, u);
+  if (uu < 1e-12) return dist(p, a);
+  const t = Math.max(0, Math.min(1, dot(sub(p, a), u) / uu));
+  return dist(p, add(a, mul(u, t)));
 }
 
 export function pointOnSegment(p: Vec3, a: Vec3, b: Vec3, eps = 1e-6): boolean {
@@ -462,10 +653,10 @@ export function pointOnSegment(p: Vec3, a: Vec3, b: Vec3, eps = 1e-6): boolean {
   return dist(p, add(a, mul(u, s))) < eps;
 }
 
-export function lineEdgeHits(l: Line3): Vec3[] {
+export function lineEdgeHits(solid: Solid, l: Line3): Vec3[] {
   const out: Vec3[] = [];
-  for (const [i, j] of EDGES) {
-    const p = lineSegmentHit(l, VERTICES[i], VERTICES[j]);
+  for (const [i, j] of solid.edges) {
+    const p = lineSegmentHit(l, solid.vertices[i], solid.vertices[j]);
     if (p) pushUnique(out, p);
   }
   return out;

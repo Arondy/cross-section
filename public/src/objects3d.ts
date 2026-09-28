@@ -6,6 +6,7 @@ import {
   sectionPolygon,
   v3,
   type Plane,
+  type Solid,
   type Vec3,
 } from './geometry';
 import { COLOR, PALETTE, cssColor } from './colors';
@@ -151,11 +152,11 @@ function planeBasis(pl: Plane): { origin: THREE.Vector3; u: THREE.Vector3; w: TH
 /**
  * Отсекающие плоскости, совпадающие с самой плоскостью объекта, убираются.
  *
- * Лист обрезается полупространствами граней куба, а при совпадении с гранью
+ * Лист обрезается полупространствами граней фигуры, а при совпадении с гранью
  * расстояние до её clip-плоскости равно нулю: фрагменты по краю случайно то
  * режутся, то нет, и плоскость покрывается крапом, хотя сечение построено
- * верно. Остальные пять полупространств лист по-прежнему держат в габарите
- * куба, поэтому он не выходит за пределы.
+ * верно. Остальные полупространства лист по-прежнему держат в габарите
+ * фигуры, поэтому он не выходит за пределы.
  */
 function clipForPlane(pl: Plane, clip: THREE.Plane[]): THREE.Plane[] {
   const n = toV(pl.n);
@@ -163,19 +164,35 @@ function clipForPlane(pl: Plane, clip: THREE.Plane[]): THREE.Plane[] {
     const k = cp.normal.dot(n);
     if (Math.abs(Math.abs(k) - 1) > 1e-3) return true;
     // Грань, параллельная плоскости, лежит на ней, только если её знак
-    // совпадает: иначе это грань с противоположной стороны куба.
+    // совпадает: иначе это грань с противоположной стороны фигуры.
     const s = k > 0 ? pl.d : -pl.d;
     return Math.abs(s + cp.constant) > 1e-3;
   });
 }
 
-function buildPlane(obj: PlaneObj, index: number, selected: boolean, clip: THREE.Plane[]): THREE.Group {
+/**
+ * Половина стороны листа. Сечение любой выпуклой фигуры лежит внутри неё, а
+ * фигура - внутри описанной сферы, поэтому радиуса до самой дальней вершины
+ * хватает с запасом. Константа здесь обрезала бы лист у наклонного
+ * параллелепипеда: его сечение шире, чем у куба.
+ */
+function sheetRadius(solid: Solid): number {
+  return Math.max(...solid.vertices.map((p) => Math.hypot(p.x, p.y, p.z))) * 1.1;
+}
+
+function buildPlane(
+  solid: Solid,
+  obj: PlaneObj,
+  index: number,
+  selected: boolean,
+  clip: THREE.Plane[]
+): THREE.Group {
   const g = new THREE.Group();
   const color = pickColor(PALETTE.plane, index);
-  const poly = sectionPolygon(obj.plane);
+  const poly = sectionPolygon(solid, obj.plane);
   const { origin, u, w } = planeBasis(obj.plane);
 
-  const size = 1.9;
+  const size = sheetRadius(solid);
   const sheet = new THREE.Mesh(
     new THREE.PlaneGeometry(size * 2, size * 2),
     new THREE.MeshBasicMaterial({
@@ -225,7 +242,7 @@ function buildPlane(obj: PlaneObj, index: number, selected: boolean, clip: THREE
     g.add(tag(obj, fill, 'fill', false));
   }
 
-  const hits = planeEdgePoints(obj.plane);
+  const hits = planeEdgePoints(solid, obj.plane);
   hits.forEach((p, i) => {
     const dot = new THREE.Mesh(
       new THREE.SphereGeometry(selected ? 0.032 : 0.024, 14, 10),
@@ -336,7 +353,12 @@ function roundRect(
   ctx.closePath();
 }
 
-export function buildScene(doc: Doc, selection: string[], clip: THREE.Plane[]): THREE.Group {
+export function buildScene(
+  solid: Solid,
+  doc: Doc,
+  selection: string[],
+  clip: THREE.Plane[]
+): THREE.Group {
   const group = new THREE.Group();
   // Индексы нумеруют объекты каждого вида отдельно, чтобы цвета не повторялись
   // у соседей одного вида.
@@ -348,7 +370,7 @@ export function buildScene(doc: Doc, selection: string[], clip: THREE.Plane[]): 
     if (obj.kind === 'point') group.add(buildPoint(obj, selected));
     else if (obj.kind === 'line') group.add(buildLine(obj, index, selected));
     else if (obj.kind === 'segment') group.add(buildSegment(obj, index, selected));
-    else group.add(buildPlane(obj, index, selected, clip));
+    else group.add(buildPlane(solid, obj, index, selected, clip));
   }
   return group;
 }

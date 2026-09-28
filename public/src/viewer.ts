@@ -1,19 +1,20 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import {
-  EDGES,
-  FACES,
-  HALF,
-  VERTICES,
+  DEFAULT_SOLID,
+  SOLIDS,
   closestPointOnSegmentToRay,
   dist,
+  distPointSegment,
   lineChordInHalfspaces,
-  projectToFaceQuad,
+  mul,
+  projectToFace,
   trimmedSpan,
   v3,
   type Cut,
   type HalfSpace,
   type Line3,
+  type Solid,
   type Vec3,
 } from './geometry';
 import { COLOR, cssColor } from './colors';
@@ -31,8 +32,11 @@ export class Viewer {
   controls: OrbitControls;
   raycaster = new THREE.Raycaster();
   pointer = new THREE.Vector2();
-  cubeGroup = new THREE.Group();
+  /** Фигура на сцене. Её ставит `setSolid`, остальное читает отсюда. */
+  solid: Solid = SOLIDS[DEFAULT_SOLID];
+  solidGroup = new THREE.Group();
   faceMeshes: THREE.Mesh[] = [];
+  private gridGroup = new THREE.Group();
   objectsGroup = new THREE.Group();
   overlayGroup = new THREE.Group();
   private clipPlanes: THREE.Plane[] = [];
@@ -71,12 +75,11 @@ export class Viewer {
 
     this.scene.add(
       this.buildAxes(),
-      this.buildGrid(),
-      this.cubeGroup,
+      this.solidGroup,
       this.objectsGroup,
       this.overlayGroup
     );
-    this.buildCube();
+    this.setSolid(this.solid);
     this.resize();
   }
 
@@ -85,7 +88,7 @@ export class Viewer {
    * и по ней же работает прилипание, поэтому рисунок и цель клика не могут
    * разойтись: обе берут один и тот же отрезок из пирамиды камеры.
    *
-   * Обрезка идёт по пирамиде, а не по кубу, поэтому прямая достаёт до края
+   * Обрезка идёт по пирамиде, а не по фигуре, поэтому прямая достаёт до края
    * экрана и не обрывается там, где до него ещё далеко.
    */
   lineExtent(l: Line3): [Vec3, Vec3] | null {
@@ -133,7 +136,7 @@ export class Viewer {
         continue;
       }
       obj.visible = true;
-      const [a, b] = trimmedSpan(base, cut ?? undefined);
+      const [a, b] = trimmedSpan(this.solid, base, cut ?? undefined);
       mesh.position.set((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2);
       mesh.scale.set(1, dist(a, b), 1);
     }
@@ -143,10 +146,18 @@ export class Viewer {
     this.needsRender = true;
   }
 
-  /** Плоскости граней куба: по ним плоскость сечения обрезается по кубу. */
+  /**
+   * Плоскости граней фигуры: по ним плоскость сечения обрезается по фигуре.
+   *
+   * `THREE.Plane` держит ту сторону, где `dot(n, p) + constant >= 0`, поэтому
+   * наружу смотрящая нормаль грани входит с минусом: полупространство должно
+   * остаться внутри фигуры, а не снаружи.
+   */
   get clip(): THREE.Plane[] {
     if (!this.clipPlanes.length) {
-      this.clipPlanes = FACES.map((f) => new THREE.Plane(toV(f.normal), HALF));
+      this.clipPlanes = this.solid.faces.map(
+        (f) => new THREE.Plane(toV(mul(f.normal, -1)), f.d)
+      );
     }
     return this.clipPlanes;
   }
@@ -190,41 +201,85 @@ export class Viewer {
     return g;
   }
 
+  /**
+   * Сетка лежит под фигурой, а не под кубом: у параллелепипеда своя высота, и
+   * сетка на месте `y = −1` оказалась бы внутри него.
+   */
   private buildGrid(): THREE.Group {
     const grid = new THREE.GridHelper(4, 20, 0x4a6076, 0x33465a);
-    grid.position.y = -HALF - 0.001;
+    grid.position.y = this.floorY() - 0.001;
     (grid.material as THREE.Material).transparent = true;
     (grid.material as THREE.Material).opacity = 0.5;
     return new THREE.Group().add(grid);
   }
 
+  /** Нижняя точка фигуры: на ней стоит сетка. */
+  private floorY(): number {
+    return Math.min(...this.solid.vertices.map((v) => v.y));
+  }
+
   private highlightIndex: number | null = null;
 
-  private buildCube(): void {
+  /**
+   * Постановка фигуры на сцену. Всё, что зависит от неё, строится здесь и
+   * только здесь: каркас, полупрозрачные грани, клип-плоскости листа и сетка.
+   * Отдельные копии этих списков в других местах разошлись бы с фигурой при
+   * первой же смене.
+   */
+  setSolid(solid: Solid): void {
+    if (this.solid === solid && this.solidGroup.children.length) return;
+    this.solid = solid;
+    this.scene.remove(this.solidGroup);
+    disposeTree(this.solidGroup);
+    this.solidGroup = new THREE.Group();
+    this.scene.add(this.solidGroup);
+    this.clipPlanes = [];
+    this.faceMeshes = [];
+    this.highlightIndex = null;
+    this.buildSolid();
+    this.setGrid();
+    this.needsRender = true;
+  }
+
+  private setGrid(): void {
+    this.scene.remove(this.gridGroup);
+    disposeTree(this.gridGroup);
+    this.gridGroup = this.buildGrid();
+    this.scene.add(this.gridGroup);
+  }
+
+  /**
+   * Каркас и грани фигуры. Грань рисуется веером треугольников от первой
+   * вершины: у куба это два треугольника, у тетраэдра один, и тот же код
+   * покрывает оба случая.
+   */
+  private buildSolid(): void {
     const pts: number[] = [];
-    for (const [i, j] of EDGES) {
-      const a = VERTICES[i];
-      const b = VERTICES[j];
+    for (const [i, j] of this.solid.edges) {
+      const a = this.solid.vertices[i];
+      const b = this.solid.vertices[j];
       pts.push(a.x, a.y, a.z, b.x, b.y, b.z);
     }
     const edgeGeo = new THREE.BufferGeometry();
     edgeGeo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
-    this.cubeGroup.add(
+    this.solidGroup.add(
       new THREE.LineSegments(
         edgeGeo,
         new THREE.LineBasicMaterial({ color: 0xcfdae4, transparent: true, opacity: 0.9 })
       )
     );
 
-    FACES.forEach((face, i) => {
+    this.solid.faces.forEach((face, i) => {
       const positions: number[] = [];
-      for (const idx of face.quad) {
-        const p = VERTICES[idx];
+      for (const idx of face.poly) {
+        const p = this.solid.vertices[idx];
         positions.push(p.x, p.y, p.z);
       }
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-      geo.setIndex([0, 1, 2, 0, 2, 3]);
+      const idx: number[] = [];
+      for (let k = 1; k + 1 < face.poly.length; k++) idx.push(0, k, k + 1);
+      geo.setIndex(idx);
       const mesh = new THREE.Mesh(
         geo,
         new THREE.MeshBasicMaterial({
@@ -238,7 +293,7 @@ export class Viewer {
       mesh.userData.faceIndex = i;
       mesh.renderOrder = 1;
       this.faceMeshes.push(mesh);
-      this.cubeGroup.add(mesh);
+      this.solidGroup.add(mesh);
     });
   }
 
@@ -280,16 +335,17 @@ export class Viewer {
    * Грань, на которую попадёт точка.
    *
    * Луч указателя пересекает сразу несколько граней, в том числе дальние на
-   * противоположной стороне куба: все они проецируются в один и тот же пиксель,
+   * противоположной стороне фигуры: все они проецируются в один и тот же пиксель,
    * поэтому расстояние на экране их не различает. Главный признак - глубина
    * вдоль луча, то есть ближайшая к камере грань и есть та, на которую смотрят,
    * а `faceDepth` только развязывает ничьи: он растёт в центре грани, и рядом
-   * с центром куба одного признака было бы мало, выбор выродился бы в случайность.
+   * с центром фигуры одного признака было бы мало, выбор выродился бы в
+   * случайность.
    *
    * Сначала берётся грань, в которую луч попал по-настоящему, и лишь потом та,
    * мимо которой он прошёл рядом. Иначе грань, чью плоскость луч пересекает
-   * раньше, но чей квадрат он не задел, обгоняла бы ту, что под курсором: её
-   * пересечение с плоскостью просто дальше от камеры, чем вход в куб.
+   * раньше, но чей многоугольник он не задел, обгоняла бы ту, что под курсором:
+   * её пересечение с плоскостью просто дальше от камеры, чем вход в фигуру.
    */
   pickFaceSurface(stickWorld = 0): PickResult {
     this.raycaster.setFromCamera(this.pointer, this.camera);
@@ -303,16 +359,17 @@ export class Viewer {
     let hit: Candidate | null = null;
     let near: Candidate | null = null;
 
-    for (let f = 0; f < 6; f++) {
-      const plane = new THREE.Plane(toV(FACES[f].normal), -HALF);
+    for (let f = 0; f < this.solid.faces.length; f++) {
+      const face = this.solid.faces[f];
+      const plane = new THREE.Plane(toV(face.normal), -face.d);
       const pt = new THREE.Vector3();
       if (!ray.intersectPlane(plane, pt)) continue;
       if (pt.distanceTo(ray.origin) > 40) continue;
 
       const raw = v3(pt.x, pt.y, pt.z);
-      const projected = projectToFaceQuad(raw, f);
-      // Насколько попадание вылезло за квадрат грани: ноль, когда луч лёг ровно
-      // на грань, и положительное число, когда курсор уже за её краем.
+      const projected = projectToFace(this.solid, raw, f);
+      // Насколько попадание вылезло за многоугольник грани: ноль, когда луч лёг
+      // ровно на грань, и положительное число, когда курсор уже за её краем.
       const overshoot = dist(raw, projected);
       if (overshoot > maxStick) continue;
 
@@ -334,13 +391,24 @@ export class Viewer {
     return { type: 'face', point: best.point, faceIndex: best.faceIndex };
   }
 
+  /**
+   * Насколько точка глубоко внутри своей грани: расстояние до ближайшего края.
+   *
+   * У куба это были поля до четырёх сторон квада, у произвольной грани сторон
+   * сколько угодно и они стоят под углом, поэтому берётся минимум по рёбрам
+   * многоугольника. Отрицательным числом точка за краем не бывает: грань
+   * прижата к себе функцией `projectToFace`.
+   */
   faceDepth(p: Vec3, faceIndex: number): number {
-    const n = FACES[faceIndex].normal;
-    const margins: number[] = [];
-    if (n.x === 0) margins.push(HALF - Math.abs(p.y), HALF - Math.abs(p.z));
-    if (n.y === 0) margins.push(HALF - Math.abs(p.x), HALF - Math.abs(p.z));
-    if (n.z === 0) margins.push(HALF - Math.abs(p.x), HALF - Math.abs(p.y));
-    return Math.min(...margins);
+    const face = this.solid.faces[faceIndex];
+    let best = Infinity;
+    for (let i = 0; i < face.poly.length; i++) {
+      const a = this.solid.vertices[face.poly[i]];
+      const b = this.solid.vertices[face.poly[(i + 1) % face.poly.length]];
+      const d = distPointSegment(p, a, b);
+      if (d < best) best = d;
+    }
+    return best;
   }
 
   setNdc(event: PointerEvent, canvas: HTMLCanvasElement): void {
@@ -351,12 +419,12 @@ export class Viewer {
 
   /**
    * Полупрозрачный шар - точка, которая встанет по клику. Рисуется без
-   * проверки глубины, иначе внутри куба её не было бы видно.
+   * проверки глубины, иначе внутри фигуры её не было бы видно.
    *
    * Кольцо живёт в плоскости XY, поэтому его надо развернуть по нормали грани.
    * При `faceIndex === null` опорной грани нет вовсе: у точки на прямой за
-   * пределами куба её не существует, и кольцо разворачивается в камеру, иначе
-   * торец уезжает на ребро и превью пропадает.
+   * пределами фигуры её не существует, и кольцо разворачивается в камеру,
+   * иначе торец уезжает на ребро и превью пропадает.
    */
   setPreview(point: Vec3 | null, faceIndex: number | null, kind: 'point' | 'line' = 'point'): void {
     this.clearPreview();
@@ -383,7 +451,10 @@ export class Viewer {
     ring.renderOrder = 21;
     ring.userData.isPreview = true;
     if (faceIndex !== null) {
-      ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), toV(FACES[faceIndex].normal));
+      ring.quaternion.setFromUnitVectors(
+        new THREE.Vector3(0, 0, 1),
+        toV(this.solid.faces[faceIndex].normal)
+      );
     } else {
       ring.quaternion.copy(this.camera.quaternion);
     }
@@ -446,6 +517,39 @@ export class Viewer {
       a,
       b
     );
+  }
+
+  /**
+   * Ставит камеру так, чтобы фигура целиком попала в кадр.
+   *
+   * Угол наклона и расстояние считаются от габарита фигуры, а не заданы
+   * константой: у тетраэдра вдвое меньше куба по высоте, и вид с кубического
+   * расстояния оставлял бы его мелким и смещённым.
+   */
+  fit(): void {
+    const { center, radius } = this.bounds();
+    const dir = new THREE.Vector3(3.2, 2.6, 3.6).normalize();
+    this.camera.position.copy(toV(center)).addScaledVector(dir, radius * 3.2);
+    this.controls.target.copy(toV(center));
+    this.controls.update();
+    this.needsRender = true;
+  }
+
+  /** Центр описанной сферы фигуры и её радиус: им меряется кадр. */
+  private bounds(): { center: Vec3; radius: number } {
+    const acc = this.solid.vertices.reduce(
+      (m, v) => ({
+        min: v3(Math.min(m.min.x, v.x), Math.min(m.min.y, v.y), Math.min(m.min.z, v.z)),
+        max: v3(Math.max(m.max.x, v.x), Math.max(m.max.y, v.y), Math.max(m.max.z, v.z)),
+      }),
+      { min: v3(Infinity, Infinity, Infinity), max: v3(-Infinity, -Infinity, -Infinity) }
+    );
+    const center = v3(
+      (acc.min.x + acc.max.x) / 2,
+      (acc.min.y + acc.max.y) / 2,
+      (acc.min.z + acc.max.z) / 2
+    );
+    return { center, radius: Math.max(...this.solid.vertices.map((v) => dist(v, center))) };
   }
 
   resize(): void {
