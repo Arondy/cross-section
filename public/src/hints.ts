@@ -1,4 +1,4 @@
-import type { SolidId } from './geometry';
+import type { SolidFault, SolidId } from './geometry';
 import type { Tool } from './model';
 
 /**
@@ -70,6 +70,23 @@ export function trimDone(names: string[], back: boolean): string {
  * то, что уже написано в справке «Управление». Сюда остались только сообщения
  * об ошибке, которые нужны в момент клика.
  */
+
+/**
+ * Что сказать, когда угол фигуры сдвинуть нельзя.
+ *
+ * Называется причина и то, что делать: угол остаётся на месте, и без объяснения
+ * сцена выглядела бы просто поломанной.
+ */
+export function solidFaultHint(fault: SolidFault): string {
+  const text: Record<SolidFault, string> = {
+    coincident: 'Так угол встанет на место соседнего, и ребро между ними исчезнет',
+    flatFace: 'Так три вершины лягут на одну прямую, и грань схлопнется',
+    inverted:
+      'Так фигура загнётся внутрь: грань отвернётся от центра и станет не видна снаружи',
+    collapsed: 'Так фигура ляжет в одну плоскость и станет вырожденной',
+  };
+  return `Угол не сдвинулся. ${text[fault]}. Сдвиньте его обратно`;
+}
 
 /** Что сказать, когда под курсором нет цели для инструмента. */
 export function noTargetHint(tool: Tool, solid: SolidId): string {

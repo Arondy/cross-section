@@ -54,14 +54,53 @@ export interface SolidFace {
   poly: number[];
 }
 
+/**
+ * Описание грани на входе `buildSolid`.
+ *
+ * Подпись бывает двух видов: у грани, параллельной оси, она выводится из самой
+ * плоскости (`x = +1.4`), у остальных задана буквами её вершин (`ABD`).
+ * `byPlane` различает их, иначе сдвинутый угол оставил бы у грани имя прежней
+ * фигуры: подпись `y = −1` у грани, уехавшей на `z = −1.4`.
+ */
+interface FaceSpec {
+  poly: number[];
+  letters?: string;
+  byPlane?: boolean;
+}
+
 export interface Solid {
   id: SolidId;
   vertices: Vec3[];
+  /** Грани в исходном виде: из них собирается та же фигура с другими вершинами. */
+  specs: FaceSpec[];
   faces: SolidFace[];
   /** Рёбра: пары индексов вершин, каждое по одному разу. */
   edges: [number, number][];
   /** Углы фигуры: имя и индекс вершины. */
   corners: { name: string; index: number }[];
+}
+
+/**
+ * Подпись грани, параллельной одной из осей: `x = +1.4`.
+ *
+ * Имя берётся у самой плоскости, а не у фигуры-образца: после сдвига угла грань
+ * стоит на другом расстоянии, и подпись прежней фигуры стала бы враньём в
+ * сообщении об ошибке. Для грани, утратившей параллельность оси, подписи по
+ * плоскости нет вовсе, и возвращается `null` - тогда грань называется буквами
+ * своих вершин, как у наклонного параллелепипеда.
+ */
+function planeFaceName(normal: Vec3, d: number): string | null {
+  const parts = [normal.x, normal.y, normal.z];
+  const a = parts.map(Math.abs);
+  const axis = a[0] > a[1] && a[0] > a[2] ? 0 : a[1] > a[2] ? 1 : 2;
+  if (a.reduce((s, x) => s + x, 0) - a[axis] > 1e-6) return null;
+  // Знак берётся у положения грани, а не у `d`: `d` у внешней нормали всегда
+  // положителен, и по нему обе противоположные грани назывались бы одинаково.
+  const at = parts[axis] * d;
+  // Расстояние приводится к трём знакам: без этого куб называл бы свои грани
+  // `x = +0.9999999999999999` вместо `x = +1`, и подпись расползлась бы с той же
+  // арифметикой, что и в полях координат.
+  return `${'xyz'[axis]} = ${at < 0 ? '−' : '+'}${Math.round(Math.abs(at) * 1000) / 1000}`;
 }
 
 /**
@@ -73,30 +112,32 @@ export interface Solid {
  * ошибки выглядели одинаково: подсветка горела не там, чертёж был верный.
  * Рёбер отдельно нет: они идут по кругу граней, иначе список рёбер разошёлся
  * бы с набором граней.
+ *
+ * Отказ возвращается значением, а не исключением: сдвинутый угол может выродить
+ * грань, и ронять из-за этого приложение нельзя - движок откатит угол обратно.
  */
-function makeSolid(
+function buildSolid(
   id: SolidId,
   vertices: Vec3[],
-  specs: { name: string; poly: number[] }[],
+  specs: FaceSpec[],
   corners: { name: string; index: number }[]
-): Solid {
-  const center = mul(
-    vertices.reduce((s, p) => add(s, p), v3(0, 0, 0)),
-    1 / vertices.length
-  );
-  const faces: SolidFace[] = specs.map((spec) => {
+): Solid | null {
+  const center = centerOf(vertices);
+  const faces: SolidFace[] = [];
+  for (const spec of specs) {
     const [a, b, c] = spec.poly;
     const winding = norm(cross(sub(vertices[b], vertices[a]), sub(vertices[c], vertices[a])));
-    if (!winding) throw new Error(`Грань ${spec.name} вырождена: вершины лежат на одной прямой`);
+    if (!winding) return null;
     const inward = dot(winding, sub(vertices[a], center)) < 0;
     const normal = inward ? mul(winding, -1) : winding;
-    return {
-      name: spec.name,
+    const d = dot(normal, vertices[a]);
+    faces.push({
+      name: (spec.byPlane ? planeFaceName(normal, d) : null) ?? spec.letters ?? '',
       normal,
-      d: dot(normal, vertices[a]),
+      d,
       poly: inward ? spec.poly.slice().reverse() : spec.poly,
-    };
-  });
+    });
+  }
   const edges: [number, number][] = [];
   for (const face of faces) {
     face.poly.forEach((i, k) => {
@@ -105,36 +146,253 @@ function makeSolid(
       if (!edges.some(([x, y]) => x === pair[0] && y === pair[1])) edges.push(pair);
     });
   }
-  return { id, vertices, faces, edges, corners };
+  return { id, vertices, specs, faces, edges, corners };
 }
+
+/**
+ * Причина, по которой из вершин не получилась фигура: угол притащил к соседнему,
+ * грань выродилась в прямую, фигура вывернулась наизнанку или легла в плоскость.
+ *
+ * Отказы различаются, потому что лечатся по-разному: от схлопывания уводят
+ * назад по той же оси, от выворота - возвратом на исходное место.
+ */
+export type SolidFault = 'coincident' | 'flatFace' | 'inverted' | 'collapsed';
+
+/** Собранная фигура вместе с вершинами, из которых она вышла. */
+export type SolidFit =
+  | { ok: true; solid: Solid }
+  | { ok: false; fault: SolidFault };
+
+/**
+ * Та же фигура с другими вершинами: грани, нормали, рёбра и подписи собираются
+ * заново, поэтому из куба получается параллелепипед, а не куб с выбитым углом.
+ *
+ * Пока вершины не сдвинули, отдаётся та же ссылка, что у фигуры-образца:
+ * `Viewer.setSolid` сравнивает по ссылке, и новый объект на каждый чих заставил
+ * бы пересобирать сцену целиком.
+ *
+ * Чужие вершины не подойдут даже по числу: у фигуры своя разметка граней, и
+ * вершина чужой фигуры означала бы другую грань.
+ */
+export function reshapeSolid(base: Solid, vertices: Vec3[]): SolidFit {
+  if (vertices.length !== base.vertices.length) return { ok: false, fault: 'flatFace' };
+  const shape = buildSolid(base.id, vertices, base.specs, base.corners);
+  if (!shape) return { ok: false, fault: 'flatFace' };
+  const fault = solidFault(shape);
+  return fault ? { ok: false, fault } : { ok: true, solid: shape };
+}
+
+/**
+ * Фигура из вершин, которые можно двигать, обязана остаться объёмной и
+ * невывернутой.
+ *
+ * Совпадение вершин - это вырожденная фигура: ребро схлопнулось в точку, и ни
+ * хорда, ни сечение по ней не считаются.
+ *
+ * Вогнутость ловится пересечением рёбер. Проверка «каждая вершина в
+ * полупространстве каждой грани» строже и не годится: она требует, чтобы грань
+ * осталась плоской, а сдвиг угла наклоняет грань даже у честного параллелепипеда,
+ * и отказ пришёлся бы на самый ход, ради которого всё затевалось.
+ *
+ * Проверка идёт по рёбрам, а не по граням, и в этом суть. Пересекаются именно
+ * рёбра одной грани, когда грань становится невыпуклой: у четырёхугольника
+ * стороны AB и CD общих вершин не имеют, и при загибе они пересекаются. Проверка
+ * граней этот случай пропускала бы: у каждого из этих рёбер своя грань в списке,
+ * а грани, которой они не принадлежат, та сторона пересечения не касается.
+ *
+ * Знак пирамиды от центра фигуры, казалось бы, годится тем же, но он мёртвый:
+ * `buildSolid` доворачивает обход грани наружу от центра всегда, поэтому знак
+ * положителен у любой собранной фигуры и ничего не сообщает.
+ *
+ * Рёбер у параллелепипеда двенадцать, пар без общей вершины около сорока, и
+ * проверка годится для каждого кадра перетаскивания.
+ *
+ * Второй признак - пересечение вееров граней. Сдвиг угла делает грани
+ * некомпланарными, и веер из двух треугольников может сложиться в бабочку:
+ * плоскость сечения режет такую грань вчетверо, и у куба с шестью гранями сечение
+ * даёт семь-девять вершин. Рёбра при этом могут и не пересекаться, поэтому
+ * проверка рёбер сама по себе сгиб пропускает.
+ */
+function solidFault(s: Solid): SolidFault | null {
+  for (let i = 0; i < s.vertices.length; i++) {
+    for (let j = i + 1; j < s.vertices.length; j++) {
+      if (dist(s.vertices[i], s.vertices[j]) < 1e-3) return 'coincident';
+    }
+  }
+  if (edgesCrossed(s.vertices, s.edges) || fansCrossed(s)) return 'inverted';
+  return solidVolume(s) > VOLUME_EPS ? null : 'collapsed';
+}
+
+/** Есть ли среди рёбер пересекающиеся, не имея общих концов. */
+function edgesCrossed(vertices: Vec3[], edges: [number, number][]): boolean {
+  for (let i = 0; i < edges.length; i++) {
+    for (let j = i + 1; j < edges.length; j++) {
+      const [a, b] = edges[i];
+      const [c, d] = edges[j];
+      if (a === c || a === d || b === c || b === d) continue;
+      if (segmentsHit(vertices[a], vertices[b], vertices[c], vertices[d])) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Складывается ли веер какой-нибудь грани в бабочку.
+ *
+ * Поверхность фигуры - это ровно те треугольники, которые строит `buildSolid` и
+ * рисует `Viewer`: грань веером от первой вершины. Проверяются они попарно, и
+ * треугольники с общей вершиной смежны и пересекаться не могут.
+ */
+function fansCrossed(s: Solid): boolean {
+  const tris: Vec3[][] = [];
+  for (const f of s.faces) {
+    for (let k = 1; k + 1 < f.poly.length; k++) {
+      tris.push([s.vertices[f.poly[0]], s.vertices[f.poly[k]], s.vertices[f.poly[k + 1]]]);
+    }
+  }
+  for (let i = 0; i < tris.length; i++) {
+    for (let j = i + 1; j < tris.length; j++) {
+      if (sharesVertex(tris[i], tris[j])) continue;
+      if (trianglesHit(tris[i], tris[j])) return true;
+    }
+  }
+  return false;
+}
+
+/** Есть ли у двух треугольников общая вершина: такие смежны и не пересекаются. */
+const sharesVertex = (a: Vec3[], b: Vec3[]): boolean =>
+  a.some((p) => b.some((q) => eq(p, q, 1e-9)));
+
+function trianglesHit(t1: Vec3[], t2: Vec3[]): boolean {
+  for (const [p, q] of [
+    [t1[0], t1[1]],
+    [t1[1], t1[2]],
+    [t1[2], t1[0]],
+  ]) {
+    if (segmentHitsTriangle(p, q, t2[0], t2[1], t2[2])) return true;
+  }
+  for (const [p, q] of [
+    [t2[0], t2[1]],
+    [t2[1], t2[2]],
+    [t2[2], t2[0]],
+  ]) {
+    if (segmentHitsTriangle(p, q, t1[0], t1[1], t1[2])) return true;
+  }
+  return false;
+}
+
+/**
+ * Пересекает ли отрезок треугольник.
+ *
+ * Точка пересечения ищется по знакам расстояний до плоскости грани, и лишь потом
+ * проверяется, что она внутри треугольника. Обратный порядок не годится: точка
+ * на продолжении грани прошла бы как внутри неё.
+ */
+function segmentHitsTriangle(p: Vec3, q: Vec3, a: Vec3, b: Vec3, c: Vec3): boolean {
+  const n = cross(sub(b, a), sub(c, a));
+  const d1 = dot(n, sub(p, a));
+  const d2 = dot(n, sub(q, a));
+  if (d1 * d2 > 0) return false;
+  if (Math.abs(d1) < 1e-12) return Math.abs(d2) > 1e-12 && pointInTriangle(p, n, a, b, c);
+  const t = d1 / (d1 - d2);
+  return pointInTriangle(lerp(p, q, t), n, a, b, c);
+}
+
+/**
+ * Внутри ли точка треугольника. Знаки берутся у векторных произведений, ведущих
+ * по его сторонам: у точки снаружи хотя бы одно смотрит в другую сторону от
+ * нормали.
+ */
+function pointInTriangle(m: Vec3, n: Vec3, a: Vec3, b: Vec3, c: Vec3): boolean {
+  return (
+    dot(cross(sub(b, a), sub(m, a)), n) >= 0 &&
+    dot(cross(sub(c, b), sub(m, b)), n) >= 0 &&
+    dot(cross(sub(a, c), sub(m, c)), n) >= 0
+  );
+}
+
+/**
+ * Пересекаются ли отрезки в пространстве.
+ *
+ * Отрезки различны по направлению, иначе они лежат на одной прямой: параллельные
+ * рёбра одной грани не пересекаются никогда, а коллинеарных рёбер у фигуры нет.
+ *
+ * Считаются параметры пересечения `t` и `s`: точка пересечения есть, если оба
+ * лежат внутри своих отрезков. Параметры осмыслены только у компланарных отрезков,
+ * поэтому комплалярность проверяется первой.
+ *
+ * Одних знаков «по разные стороны от плоскости» мало, и это была настоящая ошибка:
+ * у компланарных отрезков, какими являются соседние стороны одной грани, знаки
+ * нулевые у обоих концов, и такой признак считал их пересекающимися при любых
+ * вершинах. На исходном кубе так отвергался любой сдвиг угла, то есть ровно то,
+ * ради чего всё затевалось.
+ */
+function segmentsHit(p1: Vec3, p2: Vec3, p3: Vec3, p4: Vec3): boolean {
+  const u = sub(p2, p1);
+  const w = sub(p4, p3);
+  const n = cross(u, w);
+  const nn = dot(n, n);
+  if (nn < 1e-18) return false;
+  // Компланарность. Дальше считаются параметры пересечения, а они имеют смысл
+  // только у отрезков в одной плоскости.
+  if (Math.abs(dot(n, sub(p3, p1))) > 1e-9) return false;
+  // Параметр t на первом отрезке, s на втором. Пересечение есть, если оба лежат
+  // внутри своих отрезков.
+  const t = dot(cross(sub(p3, p1), w), n) / nn;
+  const s = dot(cross(sub(p1, p3), u), n) / nn;
+  return t >= -1e-9 && t <= 1 + 1e-9 && s >= -1e-9 && s <= 1 + 1e-9;
+}
+
+/** Центр фигуры: среднее по вершинам. Им же решается, куда смотрят нормали. */
+function centerOf(vertices: Vec3[]): Vec3 {
+  return mul(vertices.reduce((s, p) => add(s, p), v3(0, 0, 0)), 1 / vertices.length);
+}
+
+/**
+ * Объём выпуклого многогранника через сумму тетраэдров от начала координат.
+ *
+ * Считается по граням, а не по разности углов: у невывернутой фигуры знак
+ * объёма положителен, и ноль означает, что фигура схлопнулась в плоскость.
+ */
+function solidVolume(s: Solid): number {
+  let v = 0;
+  for (const f of s.faces) {
+    const a = s.vertices[f.poly[0]];
+    for (let k = 1; k + 1 < f.poly.length; k++) {
+      v += dot(a, cross(s.vertices[f.poly[k]], s.vertices[f.poly[k + 1]])) / 6;
+    }
+  }
+  return v;
+}
+
+/** Ниже этого объёма фигура считается плоской: углы сдвинули почти в одну плоскость. */
+const VOLUME_EPS = 1e-4;
 
 /**
  * Раскладка вершин параллелепипеда. Индекс кодирует, какие из трёх рёбер уже
  * добавлены к A, поэтому он не совпадает с порядком букв: 0 = A, 1 = D,
  * 2 = A₁, 3 = D₁, 4 = B, 5 = C, 6 = B₁, 7 = C₁.
  */
-const BOX_FACES: { axis: 0 | 1 | 2; side: 0 | 1; poly: number[] }[] = [
-  { axis: 1, side: 0, poly: [0, 4, 5, 1] }, // ABCD
-  { axis: 1, side: 1, poly: [2, 6, 7, 3] }, // A₁B₁C₁D₁
-  { axis: 0, side: 0, poly: [0, 4, 6, 2] }, // ABB₁A₁
-  { axis: 0, side: 1, poly: [4, 5, 7, 6] }, // BCC₁B₁
-  { axis: 2, side: 0, poly: [1, 0, 2, 3] }, // DAA₁D₁
-  { axis: 2, side: 1, poly: [5, 1, 3, 7] }, // CDD₁C₁
+const BOX_FACES: number[][] = [
+  [0, 4, 5, 1], // ABCD
+  [2, 6, 7, 3], // A₁B₁C₁D₁
+  [0, 4, 6, 2], // ABB₁A₁
+  [4, 5, 7, 6], // BCC₁B₁
+  [1, 0, 2, 3], // DAA₁D₁
+  [5, 1, 3, 7], // CDD₁C₁
 ];
 
 const BOX_LETTERS = ['A', 'D', 'A₁', 'D₁', 'B', 'C', 'B₁', 'C₁'];
-
-/** Подпись грани прямоугольного параллелепипеда: `x = +1.4`. */
-const axisFace = (halves: Vec3) => (_letters: string, axis: 0 | 1 | 2, side: 0 | 1): string =>
-  `${'xyz'[axis]} = ${side ? '+' : '−'}${axis === 0 ? halves.x : axis === 1 ? halves.y : halves.z}`;
-
-/** Подпись грани наклонного параллелепипеда: четыре буквы её вершин. */
-const letterFace = (letters: string): string => letters;
 
 /**
  * Параллелепипед из трёх рёбер, выходящих из A. Куб и прямоугольный
  * параллелепипед - частные случаи, отличаются только рёбрами, поэтому правила
  * сечения у них общие по построению, а не по совпадению.
+ *
+ * Грани называются по своей плоскости (`x = +1.4`) или буквами вершин
+ * (`ABB₁A₁`). Различие не в том, как грань выглядит, а в том, переживёт ли её
+ * подпись сдвиг угла: у грани, параллельной оси, расстояние берётся заново, у
+ * грани под углом буквы остаются теми же.
  */
 function parallelepiped(
   id: SolidId,
@@ -142,7 +400,7 @@ function parallelepiped(
   u: Vec3,
   v: Vec3,
   w: Vec3,
-  faceName: (letters: string, axis: 0 | 1 | 2, side: 0 | 1) => string
+  byPlane: boolean
 ): Solid {
   const vertices: Vec3[] = [];
   for (let i = 0; i < 8; i++) {
@@ -152,15 +410,19 @@ function parallelepiped(
     if (i & 1) p = add(p, w);
     vertices.push(p);
   }
-  return makeSolid(
+  return buildSolid(
     id,
     vertices,
-    BOX_FACES.map((f) => ({
-      name: faceName(f.poly.map((i) => BOX_LETTERS[i]).join(''), f.axis, f.side),
-      poly: f.poly,
+    BOX_FACES.map((poly) => ({
+      poly,
+      byPlane,
+      // Буквы есть и у граней, называемых по плоскости: сдвинутый угол может
+      // свести грань с оси, и тогда назвать её буквами лучше, чем не назвать
+      // вовсе.
+      letters: poly.map((i) => BOX_LETTERS[i]).join(''),
     })),
     BOX_LETTERS.map((name, index) => ({ name, index }))
-  );
+  )!;
 }
 
 /** Правильный тетраэдр, вписанный в куб: рёбра те же, что у куба. */
@@ -174,22 +436,8 @@ const TETRA_CORNERS: { name: string; p: Vec3 }[] = [
 ];
 
 export const SOLIDS: Record<SolidId, Solid> = {
-  cube: parallelepiped(
-    'cube',
-    v3(-1, -1, -1),
-    v3(2, 0, 0),
-    v3(0, 2, 0),
-    v3(0, 0, 2),
-    axisFace(v3(1, 1, 1))
-  ),
-  box: parallelepiped(
-    'box',
-    v3(-1, -0.6, -1.2),
-    v3(2, 0, 0),
-    v3(0, 1.2, 0),
-    v3(0, 0, 2.4),
-    axisFace(v3(1, 0.6, 1.2))
-  ),
+  cube: parallelepiped('cube', v3(-1, -1, -1), v3(2, 0, 0), v3(0, 2, 0), v3(0, 0, 2), true),
+  box: parallelepiped('box', v3(-1, -0.6, -1.2), v3(2, 0, 0), v3(0, 1.2, 0), v3(0, 0, 2.4), true),
   // Наклонный параллелепипед проверяет, что правила не завязаны на грани,
   // параллельные осям: его боковые грани стоят под углом ко всем трём.
   slant: parallelepiped(
@@ -198,19 +446,19 @@ export const SOLIDS: Record<SolidId, Solid> = {
     v3(2, 0, 0),
     v3(0.6, 1.4, 0),
     v3(0, 0, 2.2),
-    letterFace
+    false
   ),
-  tetra: makeSolid(
+  tetra: buildSolid(
     'tetra',
     TETRA_CORNERS.map((c) => c.p),
     [
-      { name: 'ABC', poly: [0, 1, 2] },
-      { name: 'ABD', poly: [0, 1, 3] },
-      { name: 'ACD', poly: [0, 2, 3] },
-      { name: 'BCD', poly: [1, 2, 3] },
+      { poly: [0, 1, 2], letters: 'ABC' },
+      { poly: [0, 1, 3], letters: 'ABD' },
+      { poly: [0, 2, 3], letters: 'ACD' },
+      { poly: [1, 2, 3], letters: 'BCD' },
     ],
     TETRA_CORNERS.map((c, index) => ({ name: c.name, index }))
-  ),
+  )!,
 };
 
 export interface Plane {

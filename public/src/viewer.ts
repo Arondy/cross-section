@@ -490,6 +490,21 @@ export class Viewer {
     return null;
   }
 
+  /**
+   * Луч указателя в плоскости, параллельной экрану и проходящей через `p`.
+   *
+   * Так двигается угол фигуры: у него нет опорной грани, иначе тянуть пришлось бы
+   * по одной оси за раз, а свободное движение в плоскости экрана - единственное,
+   * что человек видит с одного взгляда. Плоскость берётся через саму точку
+   * угла, иначе угол уезжал бы вглубь по ходу луча, и при повороте сцены
+   * двигался бы совсем не туда.
+   */
+  rayThroughScreen(p: Vec3): Vec3 | null {
+    const dir = new THREE.Vector3();
+    this.camera.getWorldDirection(dir);
+    return this.rayToPlane(dir, -dir.dot(toV(p)));
+  }
+
   rayToPlane(n: THREE.Vector3, d: number): Vec3 | null {
     this.raycaster.setFromCamera(this.pointer, this.camera);
     const plane = new THREE.Plane(n, d);

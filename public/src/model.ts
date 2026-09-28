@@ -1,9 +1,12 @@
 import {
   DEFAULT_SOLID,
   SOLIDS,
+  clone,
   eq,
+  reshapeSolid,
   type Plane,
   type Solid,
+  type SolidFault,
   type SolidId,
   type Trims,
   type Vec3,
@@ -18,9 +21,10 @@ export interface BaseObj {
   color: string;
   visible: boolean;
   /**
-   * Угловые точки фигуры. Их нельзя удалить, перетащить и сдвинуть. Имена у них
-   * свои, из углов фигуры, поэтому пользовательские точки начинаются с E и не
-   * занимают буквы углов.
+   * Угловая точка фигуры. Её нельзя удалить, но можно сдвинуть: сдвиг меняет саму
+   * фигуру, и из куба получается параллелепипед. Имена у углов свои, из углов
+   * фигуры, поэтому пользовательские точки начинаются с E и не занимают буквы
+   * углов.
    */
   fixed?: boolean;
 }
@@ -29,6 +33,12 @@ export interface PointObj extends BaseObj {
   kind: 'point';
   p: Vec3;
   face: number | null;
+  /**
+   * Индекс вершины фигуры, если это угол. По нему вершина собирается заново при
+   * сдвиге угла, иначе фигура и её углы разошлись бы: подпись грани и
+   * подсветка смотрели бы на прежние вершины, а на сцене стояли бы новые.
+   */
+  corner?: number;
 }
 
 /**
@@ -136,7 +146,7 @@ export function makePoint(
   doc: Doc,
   p: Vec3,
   face: number | null,
-  opts: { name?: string; fixed?: boolean } = {}
+  opts: { name?: string; fixed?: boolean; corner?: number } = {}
 ): PointObj {
   return {
     id: nextId('pt'),
@@ -149,6 +159,7 @@ export function makePoint(
     p,
     face,
     fixed: opts.fixed,
+    corner: opts.corner,
   };
 }
 
@@ -161,7 +172,9 @@ export function makePoint(
 export function addCorners(doc: Doc, solid: Solid): void {
   for (const c of solid.corners) {
     const p = solid.vertices[c.index];
-    doc.objects.push(makePoint(doc, p, null, { name: c.name, fixed: true }));
+    doc.objects.push(
+      makePoint(doc, p, null, { name: c.name, fixed: true, corner: c.index })
+    );
   }
 }
 
@@ -234,10 +247,52 @@ export class Store {
   private undoStack: Doc[] = [];
   private redoStack: Doc[] = [];
   private listeners = new Set<Listener>();
+  /**
+   * Собранная фигура при неизменном документе. За один `refresh` к `store.solid`
+   * обращаются несколько раз, и без кеша каждый раз вышла бы новая ссылка: её
+   * потом сравнивал бы `Viewer.setSolid` и пересобирал сцену заново.
+   */
+  private solidCache: Solid | null = null;
 
-  /** Фигура текущего документа: геометрия всегда берётся отсюда. */
+  /**
+   * Фигура текущего документа: геометрия всегда берётся отсюда.
+   *
+   * Вершины берутся у углов сцены, а не из палитры `SOLIDS`, поэтому сдвинутый
+   * угол меняет саму фигуру. Пока углы на местах, отдаётся та же ссылка, что и у
+   * фигуры-образца: `Viewer.setSolid` сравнивает по ссылке, и новый объект на
+   * каждое обновление заставлял бы пересобирать сцену целиком. `store.solid`
+   * берут все, и каждый чих заново собирать шесть граней было бы заметно.
+   */
   get solid(): Solid {
-    return SOLIDS[this.doc.solid];
+    if (this.solidCache) return this.solidCache;
+    const base = SOLIDS[this.doc.solid];
+    const corners = this.corners();
+    // Пока углы на местах, отдаётся та же ссылка, что и у фигуры-образца:
+    // `Viewer.setSolid` сравнивает по ссылке, и новый объект на каждое обновление
+    // заставлял бы пересобирать сцену целиком.
+    if (corners.every((p, i) => eq(p, base.vertices[i]))) this.solidCache = base;
+    else {
+      const fit = reshapeSolid(base, corners);
+      // Отказ означает, что документ держит вершины, из которых фигура не
+      // собирается. Такое бывает только если углы двигали в обход `moveCorner`,
+      // иначе он бы откатил их. Рисуем образец, а не поломанную фигуру.
+      this.solidCache = fit.ok ? fit.solid : base;
+    }
+    return this.solidCache;
+  }
+
+  /**
+   * Вершины фигуры по углам сцены. Углов может не быть вовсе - документ с
+   * пустым списком углов собирается из фигуры-образца, иначе проверка на
+   * совпадение вершин падала бы на длине нуля.
+   */
+  private corners(): Vec3[] {
+    const base = SOLIDS[this.doc.solid];
+    const out = base.vertices.map(clone);
+    for (const o of this.doc.objects) {
+      if (o.kind === 'point' && o.corner !== undefined) out[o.corner] = o.p;
+    }
+    return out;
   }
 
   subscribe(fn: Listener): () => void {
@@ -246,6 +301,10 @@ export class Store {
   }
 
   emit(): void {
+    // Документ изменился, значит собранная фигура больше не годится. Кеш
+    // сбрасывается здесь, а не в каждом месте правки: забытый сброс означал бы,
+    // что `store.solid` молча рисует по устаревшим вершинам.
+    this.solidCache = null;
     for (const fn of this.listeners) fn(this.doc);
   }
 
@@ -256,6 +315,10 @@ export class Store {
       if (this.undoStack.length > 100) this.undoStack.shift();
       this.redoStack.length = 0;
     }
+    // До правки, а не после: внутри `mutate` читают `store.solid` и по уже
+    // изменённым вершинам - так `moveCorner` проверяет фигуру, не собирая её
+    // дважды.
+    this.solidCache = null;
     mutate(this.doc);
     this.emit();
   }
@@ -288,6 +351,34 @@ export class Store {
     return this.doc.objects.find(
       (o): o is PointObj => o.kind === 'point' && eq(o.p, p, eps)
     );
+  }
+
+  /**
+   * Сдвиг угла фигуры. Возвращает причину отказа, если фигура из новых вершин не
+   * получилась, и `null` при удаче.
+   *
+   * Проверка живёт здесь, а не в обработчике: отказ не должен оставлять угол в
+   * положении, из которого фигура не собирается, - иначе грани, рёбра и сечение
+   * считали бы по вывернутой фигуре. Правка идёт одним `update` вместе с
+   * пересборкой, иначе на одно перетаскивание вышло бы два шага отмены: сначала
+   * сдвиг, потом возврат.
+   */
+  moveCorner(id: string, p: Vec3, opts: { history?: boolean } = {}): SolidFault | null {
+    const obj = this.get(id);
+    if (!obj || obj.kind !== 'point' || obj.corner === undefined) return null;
+    const fit = reshapeSolid(SOLIDS[this.doc.solid], this.movedCorner(obj.corner, p));
+    if (!fit.ok) return fit.fault;
+    this.update(id, (o) => {
+      if (o.kind === 'point') o.p = clone(p);
+    }, opts);
+    return null;
+  }
+
+  /** Вершины фигуры, где указанной подставлено новое положение. */
+  private movedCorner(index: number, p: Vec3): Vec3[] {
+    const out = this.corners();
+    out[index] = clone(p);
+    return out;
   }
 
   /**
@@ -337,11 +428,14 @@ export class Store {
   /**
    * Переименование объекта. Пустое имя возвращается к прежнему, иначе на
    * сцене осталась бы безымянная точка, которую нечем опознать в списке.
+   *
+   * Угол фигуры не переименовывается: его имя пришло из нотации фигуры и стоит в
+   * подписи грани, поэтому точка P рядом с гранью DAA₁D₁ читалась бы как опечатка.
    */
   rename(id: string, name: string): void {
     const trimmed = name.trim();
     const obj = this.get(id);
-    if (!obj || !trimmed || trimmed === obj.name) return;
+    if (!obj || obj.fixed || !trimmed || trimmed === obj.name) return;
     this.update(id, (o) => {
       o.name = trimmed;
     });

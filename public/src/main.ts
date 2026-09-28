@@ -22,6 +22,7 @@ import {
   v3,
   type Line3,
   type Plane,
+  type SolidFault,
   type SolidId,
   type TrimEnd,
   type Vec3,
@@ -46,6 +47,7 @@ import {
   SOLIDS_UI,
   TOOLS_UI,
   noTargetHint,
+  solidFaultHint,
   solidGen,
   trimDone,
   trimHint,
@@ -91,7 +93,7 @@ type ToolState = {
   snapEnabled: boolean;
   chainEnabled: boolean;
   stickRadius: number;
-  drag: null | { id: string; part: string; moved: boolean };
+  drag: null | { id: string; part: string; moved: boolean; refused: boolean };
   hoverInfo: string;
 };
 
@@ -820,7 +822,7 @@ canvas.addEventListener('pointerdown', (e) => {
     const hit = viewer.pickObject();
     if (hit) {
       store.toggleSelect(hit.id, e.shiftKey);
-      state.drag = { id: hit.id, part: hit.part, moved: false };
+      state.drag = { id: hit.id, part: hit.part, moved: false, refused: false };
       viewer.controls.enabled = false;
       return;
     }
@@ -850,8 +852,21 @@ canvas.addEventListener('pointermove', (e) => {
         const part = state.drag.part;
         // В историю попадает только первый кадр перетаскивания, иначе одно
         // движение мыши забило бы стек отмены.
-        store.update(id, (o) => applyDragTo(o, part, next), { history: !state.drag!.moved });
+        const history = !state.drag.moved;
+        // Угол фигуры идёт через `moveCorner`: тот проверяет, что фигура из новых
+        // вершин ещё собирается, иначе сцена осталась бы с углом, которого нет.
+        const fault = moveObject(id, part, next, history);
+        if (fault) {
+          // Сообщение одно на всё перетаскивание: угол отказывают десятки кадров
+          // подряд, и мигающая плашка забила бы собой всё остальное.
+          if (!state.drag.refused) {
+            state.drag.refused = true;
+            flash(solidFaultHint(fault));
+          }
+          return;
+        }
         state.drag.moved = true;
+        state.drag.refused = false;
       }
     }
     return;
@@ -859,6 +874,31 @@ canvas.addEventListener('pointermove', (e) => {
   updateHover();
   viewer.requestRender();
 });
+
+/** Правка положения обычной точки. Фигура от неё не зависит, отказа не бывает. */
+function movePoint(id: string, p: Vec3): SolidFault | null {
+  store.update(id, (o) => {
+    if (o.kind === 'point') o.p = p;
+  });
+  return null;
+}
+
+/**
+ * Сдвиг объекта при перетаскивании. Угол фигуры идёт через `moveCorner`,
+ * остальное - обычной правкой: угол двигает саму фигуру, а точку двигают по её
+ * граням.
+ */
+function moveObject(
+  id: string,
+  part: string,
+  next: Vec3,
+  history: boolean
+): SolidFault | null {
+  const obj = store.get(id);
+  if (obj?.kind === 'point' && obj.fixed) return store.moveCorner(id, next, { history });
+  store.update(id, (o) => applyDragTo(o, part, next), { history });
+  return null;
+}
 
 function applyDragTo(obj: SceneObj, part: string, next: Vec3): void {
   if (obj.kind === 'point') obj.p = next;
@@ -1139,8 +1179,18 @@ function trimControls(obj: LineObj): HTMLElement {
   return wrap;
 }
 
+/**
+ * Куда встал бы объект под курсором.
+ *
+ * Угол фигуры тянется свободно, в плоскости экрана: он не принадлежит ни одной
+ * грани, и притягивание к грани заставляло бы перескакивать между ними при
+ * пересечении края. Остальные объекты по-прежнему прилипают к своим граням, иначе
+ * точка соскочила бы с грани в воздух.
+ */
 function draggedPosition(obj: SceneObj, part: string): Vec3 | null {
-  if (obj.fixed) return null;
+  if (obj.fixed) {
+    return obj.kind === 'point' ? viewer.rayThroughScreen(obj.p) : null;
+  }
   if (obj.kind === 'point' || obj.kind === 'line' || obj.kind === 'segment') {
     const target = resolveTarget();
     if (!target) return null;
@@ -1187,9 +1237,21 @@ function renderProperties(): void {
     card.className = 'card';
     card.append(nameField(obj));
     if (obj.kind === 'point') {
-      card.append(vecInputs('Координаты', obj.p, (p) => store.update(obj.id, (o) => {
-        if (o.kind === 'point') o.p = p;
-      })));
+      // Координаты угла меняют саму фигуру, поэтому идут через `moveCorner`:
+      // свойства не должны быть путём, где проверки фигуры нет.
+      card.append(
+        vecInputs(obj.fixed ? 'Положение угла' : 'Координаты', obj.p, (p) => {
+          const fault = obj.fixed
+            ? store.moveCorner(obj.id, p)
+            : movePoint(obj.id, p);
+          if (fault) {
+            // Отказ возвращает полю прежнее число: иначе введённое значение
+            // осталось бы стоять в поле, хотя на сцене угол не сдвинулся.
+            flash(solidFaultHint(fault));
+            renderProperties();
+          }
+        })
+      );
     } else if (obj.kind === 'line' || obj.kind === 'segment') {
       // Отсечение живёт точкой в пространстве, поэтому перенос конца сбрасывает
       // только свою сторону, вторая остаётся.
@@ -1261,7 +1323,10 @@ function nameField(obj: SceneObj): HTMLElement {
   wrap.className = 'field';
   const l = document.createElement('span');
   l.className = 'field-label';
-  l.textContent = obj.fixed ? `Имя (угол ${solidGen(store.doc.solid)})` : 'Имя';
+  // Угол фигуры не переименовать: имя пришло из нотации и стоит в подписи грани.
+  // Иначе человек вводил бы имя, а оно молча не сохранялось бы.
+  if (obj.fixed) return readout('Имя угла', obj.name);
+  l.textContent = 'Имя';
   const input = document.createElement('input');
   input.type = 'text';
   input.className = 'name-input';
@@ -1513,5 +1578,6 @@ viewer.fit();
 // приложении не влияют.
 (window as unknown as Record<string, unknown>).__viewer = viewer;
 (window as unknown as Record<string, unknown>).__store = store;
+(window as unknown as Record<string, unknown>).__THREE = THREE;
 refresh();
 viewer.start();
