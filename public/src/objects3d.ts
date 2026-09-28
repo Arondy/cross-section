@@ -353,6 +353,39 @@ function roundRect(
   ctx.closePath();
 }
 
+/**
+ * Незавершённый ввод: маркеры введённых точек и отрезки между ними.
+ *
+ * Живёт в `objects3d` рядом с остальными примитивами сцены, а не в точке
+ * входа: иначе `main.ts` пришлось бы снова импортировать three только ради
+ * одного шара. Первую точку цепочки красят иначе - замыкается цепочка кликом
+ * именно по ней, и без отметки это неочевидно.
+ */
+export function buildPendingOverlay(points: Vec3[], chainFirst: boolean): THREE.Group {
+  const g = new THREE.Group();
+  points.forEach((p, i) => {
+    const first = i === 0 && chainFirst;
+    const m = new THREE.Mesh(
+      new THREE.SphereGeometry(first ? 0.042 : 0.03, 14, 10),
+      new THREE.MeshBasicMaterial({
+        color: first ? COLOR.chainFirst : 0xffffff,
+        depthTest: false,
+        transparent: true,
+        opacity: 0.85,
+      })
+    );
+    m.position.set(p.x, p.y, p.z);
+    m.renderOrder = 12;
+    g.add(m);
+    if (i > 0) {
+      const link = fatLine(toV(points[i - 1]), toV(p), 0xffffff, 0.006);
+      link.renderOrder = 11;
+      g.add(link);
+    }
+  });
+  return g;
+}
+
 export function buildScene(
   solid: Solid,
   doc: Doc,
