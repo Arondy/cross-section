@@ -13,18 +13,14 @@
   <body>
     <div class="app">
       <aside class="panel left">
-        <h1>Сечение куба</h1>
+        <div class="group">
+          <div class="group-title">Фигура</div>
+          <div class="row solids" id="solids"></div>
+        </div>
 
         <div class="group">
           <div class="group-title">Инструменты</div>
-          <div class="tools">
-            <button class="tool" data-tool="select"><b>Q</b> Выбор</button>
-            <button class="tool" data-tool="point"><b>W</b> Точка</button>
-            <button class="tool" data-tool="line"><b>E</b> Прямая</button>
-            <button class="tool" data-tool="segment"><b>R</b> Отрезок</button>
-            <button class="tool" data-tool="plane"><b>T</b> Плоскость</button>
-            <button class="tool" data-tool="trim"><b>Y</b> Отсечение</button>
-          </div>
+          <div class="tools" id="tools"></div>
         </div>
 
         <div class="group">
@@ -44,7 +40,7 @@
                 <path d="M13.5 7H7.3a4 4 0 0 0 0 8H10" />
               </svg>
             </button>
-            <button id="fit" class="action" title="Показать куб целиком">Вид</button>
+            <button id="fit" class="action" title="Показать фигуру целиком">Вид</button>
           </div>
           <div class="row toggles">
             <button id="snap-toggle" class="action toggle active" aria-pressed="true">Притягивание</button>

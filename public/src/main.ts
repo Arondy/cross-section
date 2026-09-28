@@ -1,26 +1,28 @@
 import * as THREE from 'three';
 import {
-  FACE_NAMES,
   dist,
   eq,
   faceOf,
   fmt,
-  insideCube,
+  insideSolid,
   lineFromPoints,
   lineEdgeHits,
   lineIntersect,
+  norm,
   planeEdgePoints,
   planeFromPoints,
   planeSigned,
   pointFaces,
   pointOnSegment,
-  projectToFaceQuad,
+  projectToFace,
   sectionPolygon,
-  snapToCube,
+  snapToSolid,
   trimEndOf,
   trimmedSpan,
   v3,
   type Line3,
+  type Plane,
+  type SolidId,
   type TrimEnd,
   type Vec3,
 } from './geometry';
@@ -39,9 +41,17 @@ import {
   type Tool,
 } from './model';
 import { COLOR } from './colors';
-import { DEMO, NO_TARGET_HINT } from './hints';
+import {
+  DEMO,
+  SOLIDS_UI,
+  TOOLS_UI,
+  noTargetHint,
+  solidGen,
+  trimDone,
+  trimHint,
+} from './hints';
 import { HELP_TOOLS, HELP_VIEW } from './help';
-import { ICON_CROSS, ICON_EYE } from './icons';
+import { ICON_CROSS, ICON_EYE, SOLID_ICONS, TOOL_ICONS } from './icons';
 import { buildScene, fatLine, toV } from './objects3d';
 import { Viewer } from './viewer';
 
@@ -56,17 +66,17 @@ const PICK_RADIUS = 0.06;
 // поэтому координаты копятся с точностью магнита, а не машины.
 const PLANE_EPS = 1e-3;
 
-// Демонстрационный срез: шестиугольник через середины шести рёбер, плоскость
-// x + y + z = 0. Цепочка проходит по правилам, иначе демо показывало бы то,
-// что инструмент не даёт построить.
-const DEMO_PLANE: Vec3[] = [
-  v3(1, -1, 0),
-  v3(1, 0, -1),
-  v3(0, 1, -1),
-  v3(-1, 1, 0),
-  v3(-1, 0, 1),
-  v3(0, -1, 1),
-];
+// Нормаль демо-среза своя у каждой фигуры: у куба, параллелепипеда и его
+// наклонного варианта x + y + z = 0 даёт шестиугольник через середины шести
+// рёбер, а у тетраэдра та же плоскость прошла бы всего по двум рёбрам и
+// сечения не дала. Точки демо берутся из той же геометрии, что и любой чертёж,
+// поэтому демо не может разойтись с правилами инструмента.
+const DEMO_NORMAL: Record<SolidId, Vec3> = {
+  cube: v3(1, 1, 1),
+  tetra: v3(1, 0, 0),
+  box: v3(1, 1, 1),
+  slant: v3(1, 1, 1),
+};
 
 const canvas = $<HTMLCanvasElement>('#view');
 const store = new Store();
@@ -152,7 +162,7 @@ function drawnSpan(obj: LineObj | SegmentObj): [Vec3, Vec3] | null {
   const l = lineFromPoints(obj.a, obj.b);
   if (!l) return null;
   const base = viewer.lineExtent(l);
-  return base ? trimmedSpan(base, { a: obj.a, b: obj.b, trim: obj.trim }) : null;
+  return base ? trimmedSpan(store.solid, base, { a: obj.a, b: obj.b, trim: obj.trim }) : null;
 }
 
 /**
@@ -160,7 +170,7 @@ function drawnSpan(obj: LineObj | SegmentObj): [Vec3, Vec3] | null {
  * произвольном месте нельзя: разрез должен совпадать с объектом сцены,
  * иначе его нельзя ни отменить, ни показать в списке объектов.
  *
- * Точка за пределами хорды куба задаёт сторону: хвост снимается с той стороны,
+ * Точка за пределами хорды фигуры задаёт сторону: хвост снимается с той стороны,
  * где она лежит. Точки внутри хорды целью не годятся - хвоста с их стороны нет.
  *
  * Сторона, по которой уже отрезали, закрыта: целью на ней остаётся сама точка
@@ -169,29 +179,38 @@ function drawnSpan(obj: LineObj | SegmentObj): [Vec3, Vec3] | null {
  * ничего не значит, а автообрезка, закрывшая сторону, перестала бы что-то
  * запрещать. Признак «та же точка» один на цель и на действие, иначе подсказка
  * обещала бы вернуть хвост, а клик двигал бы разрез.
+ *
+ * Через точку проходит сколько угодно прямых - узел, общая точка построения, -
+ * и клик режет их все: иначе у второй прямой остался бы хвост, который человек
+ * счёл срезанным. Поэтому цель здесь список, а не единственная пара «прямая,
+ * сторона». Точка сначала выбирается одна, ближайшая к курсору, и уже потом
+ * собираются все прямые через неё: иначе под курсором нашлись бы две точки
+ * вплотную и отсечение било бы то по одной, то по другой.
  */
-function resolveTrimTarget(): TrimTarget | null {
-  let best: { target: TrimTarget; d: number } | null = null;
+function resolveTrimTargets(): TrimTarget[] {
+  let best: { point: PointObj; d: number } | null = null;
+  for (const point of store.doc.objects) {
+    if (point.kind !== 'point' || !point.visible) continue;
+    const d = viewer.rayToPointDistance(point.p.x, point.p.y, point.p.z);
+    // Побеждает ближайшая к курсору точка, а не первая найденная: под курсором
+    // их может оказаться несколько, и резать надо ту, что ближе.
+    if (d < MAGNET_RADIUS && (!best || d < best.d)) best = { point, d };
+  }
+  if (!best) return [];
+
+  const targets: TrimTarget[] = [];
   for (const obj of store.doc.objects) {
     if (!obj.visible || obj.kind !== 'line') continue;
     const seg = drawnSpan(obj);
     if (!seg) continue;
-    for (const point of store.doc.objects) {
-      if (point.kind !== 'point' || !point.visible) continue;
-      if (!pointOnSegment(point.p, seg[0], seg[1], 1e-3)) continue;
-      const end = trimEndOf(obj.a, obj.b, point.p);
-      if (end === 'inside') continue;
-      const cut = obj.trim?.[end];
-      if (cut && !sameCutPoint(cut, point.p)) continue;
-      const d = viewer.rayToPointDistance(point.p.x, point.p.y, point.p.z);
-      // Побеждает ближайшая к курсору точка, а не первая найденная: под курсором
-      // их может оказаться несколько, и резать надо ту, что ближе.
-      if (d < MAGNET_RADIUS && (!best || d < best.d)) {
-        best = { target: { obj, point, end }, d };
-      }
-    }
+    if (!pointOnSegment(best.point.p, seg[0], seg[1], 1e-3)) continue;
+    const end = trimEndOf(store.solid, obj.a, obj.b, best.point.p);
+    if (end === 'inside') continue;
+    const cut = obj.trim?.[end];
+    if (cut && !sameCutPoint(cut, best.point.p)) continue;
+    targets.push({ obj, point: best.point, end });
   }
-  return best ? best.target : null;
+  return targets;
 }
 
 function resolveTarget(): Target | null {
@@ -270,18 +289,18 @@ function resolveTarget(): Target | null {
     return {
       p: bestCross.p,
       name: '',
-      faceIndex: faceOf(bestCross.p),
+      faceIndex: faceOf(store.solid, bestCross.p),
       magnet: 'cross',
       label: 'в пересечении прямых',
     };
   }
-  // Узел прямой с ребром куба. Он предпочтительнее любой точки на прямой:
+  // Узел прямой с ребром фигуры. Он предпочтительнее любой точки на прямой:
   // иначе точка у края встаёт мимо ребра, не находит общей грани с соседней
   // точкой сечения и цепочка не замыкается. Радиус тот же, что у пересечения
   // двух прямых, - оба случая ищут одно и то же место.
   let bestEdge: { p: Vec3; d: number } | null = null;
   for (const { l, a, b } of lines) {
-    for (const p of lineEdgeHits(l)) {
+    for (const p of lineEdgeHits(store.solid, l)) {
       if (!pointOnSegment(p, a, b)) continue;
       const d = viewer.rayToPointDistance(p.x, p.y, p.z);
       if (d < CROSS_RADIUS && (!bestEdge || d < bestEdge.d)) bestEdge = { p, d };
@@ -291,16 +310,16 @@ function resolveTarget(): Target | null {
     return {
       p: bestEdge.p,
       name: '',
-      faceIndex: faceOf(bestEdge.p),
+      faceIndex: faceOf(store.solid, bestEdge.p),
       magnet: 'cross',
-      label: 'на ребре куба',
+      label: `на ребре ${solidGen(store.doc.solid)}`,
     };
   }
   if (bestLine) {
     return {
       p: bestLine.p,
       name: bestLine.name,
-      faceIndex: faceOf(bestLine.p),
+      faceIndex: faceOf(store.solid, bestLine.p),
       magnet: 'line',
       label: `на прямой ${bestLine.name}`,
     };
@@ -348,63 +367,103 @@ function updateHover(): void {
   if (target.magnet !== 'face') {
     state.hoverInfo = `${fmt(target.p)} · ${target.label}`;
   } else {
-    const snapped = snapToCube(target.p);
+    const snapped = snapToSolid(store.solid, target.p);
     const kind =
       snapped.kind === 'none' ? 'свободно' : snapped.kind === 'edge' ? 'ребро' : 'вершина';
     const stuck = dist(snapped.p, target.p) > 1e-6 ? ' · прилипание' : '';
-    state.hoverInfo = `${FACE_NAMES[target.faceIndex as number]} · ${fmt(target.p)} · ${kind}${stuck}`;
+    state.hoverInfo = `${faceName(target.faceIndex as number)} · ${fmt(target.p)} · ${kind}${stuck}`;
   }
   info.textContent = state.hoverInfo;
 }
 
 /** Превью отсечения: маркер стоит на точке разреза, грань тут ни при чём. */
 function updateTrimHover(info: HTMLElement): void {
-  const target = resolveTrimTarget();
-  if (!target) {
+  const targets = resolveTrimTargets();
+  if (!targets.length) {
     viewer.setPreview(null, null);
     viewer.setFaceHighlight(null);
     info.textContent = '';
     return;
   }
-  viewer.setPreview(target.point.p, null, 'line');
+  viewer.setPreview(targets[0].point.p, null, 'line');
   viewer.setFaceHighlight(null);
-  const side = target.end === 'start' ? 'с начала' : 'с конца';
-  const back = target.obj.trim?.[target.end] !== undefined;
-  const verb = back ? 'вернуть хвост' : 'отсечь';
-  state.hoverInfo = `${fmt(target.point.p)} · ${verb} ${side} у прямой ${target.obj.name}`;
+  const { point, side, back } = trimIntent(targets);
+  state.hoverInfo = trimHint(
+    fmt(point.p),
+    targets.map((t) => t.obj.name),
+    side,
+    back
+  );
   info.textContent = state.hoverInfo;
 }
 
 /**
- * Ставит и снимает отсечение по точке, повторный клик по той же точке отменяет
- * только её сторону. Вторая сторона при этом не трогается: чтобы убрать хвост
- * с двух сторон, нужно отсечь в двух точках.
+ * Что сделает клик по этой точке: снимет хвост или вернёт его, и с какой стороны.
+ *
+ * Действие одно на все прямые точки, а не у каждой своё. Иначе под курсором
+ * оказалась бы прямая, по которой клик вернёт хвост, и прямая, по которой он же
+ * этот хвост снова срежет, и что произойдёт, осталось бы неясным.
+ *
+ * Сторона тоже одна на все прямые: у разных прямых точки она разная, и назвать
+ * первую попавшуюся значило бы соврать про остальные. Тогда она пустая, и
+ * подсказка молчит о стороне вместо того, чтобы называть неверную.
+ *
+ * Признак общий на цель и на действие, иначе подсказка обещала бы вернуть хвост,
+ * а клик двигал бы разрез.
  */
-function applyTrim(target: TrimTarget): void {
-  const p = target.point.p;
-  const already = target.obj.trim?.[target.end];
-  const back = already !== undefined && sameCutPoint(already, p);
-  store.update(target.obj.id, (obj) => {
-    if (obj.kind !== 'line') return;
-    if (back) clearTrimEnd(obj, target.end);
-    else obj.trim = { ...obj.trim, [target.end]: { ...p } };
+function trimIntent(targets: TrimTarget[]): {
+  point: PointObj;
+  side: string;
+  back: boolean;
+} {
+  const point = targets[0].point;
+  const back = targets.every((t) => {
+    const cut = t.obj.trim?.[t.end];
+    return cut !== undefined && sameCutPoint(cut, point.p);
   });
+  const same = targets.every((t) => t.end === targets[0].end);
+  const side = same ? (targets[0].end === 'start' ? 'с начала' : 'с конца') : '';
+  return { point, side, back };
+}
+
+/**
+ * Отсечение сразу по всем прямым, что проходят через точку. Возврат хвоста
+ * ведёт себя так же: повторный клик по той же точке снимает разрез со всех
+ * прямых разом.
+ *
+ * Всё меняется одним `commit`: правка каждой прямой отдельным `update` дала бы
+ * на один клик несколько шагов отмены, и вернувшийся по Ctrl+Z чертёж разошёлся
+ * бы с тем, что обещала подсказка.
+ */
+function applyTrim(targets: TrimTarget[]): void {
+  if (!targets.length) return;
+  const { point, back } = trimIntent(targets);
+  const p = point.p;
+  store.commit((d) => {
+    for (const t of targets) {
+      const obj = d.objects.find((o) => o.id === t.obj.id);
+      if (obj?.kind !== 'line') continue;
+      if (back) clearTrimEnd(obj, t.end);
+      else obj.trim = { ...obj.trim, [t.end]: { ...p } };
+    }
+  });
+  flash(trimDone(targets.map((t) => t.obj.name), back));
 }
 
 /**
  * Автоотсечение в узле: снимает хвост со стороны, где образовался узел.
  *
  * Сторона режется автоматически не больше одного раза: иначе каждая новая прямая,
- * пересёкшая старую снаружи куба, обрезала бы ей тот же хвост заново. Ручная
+ * пересёкшая старую снаружи фигуры, обрезала бы ей тот же хвост заново. Ручная
  * отсечка тоже закрывает сторону - пользователь решил, как она должна выглядеть.
  *
- * Узел внутри куба не режется: перпендикулярные прямые в одной грани - обычное
- * дело, и их пересечение обрезать не нужно. Проверяется именно куб, а не плоскость
+ * Узел внутри фигуры не режется: перпендикулярные прямые в одной грани - обычное
+ * дело, и их пересечение обрезать не нужно. Проверяется именно фигура, а не плоскость
  * грани: узел на прямой, идущей по ребру, лежит в плоскости грани и за её краем.
  */
 function autoTrimSide(obj: LineObj, at: Vec3, inside: boolean): TrimEnd | null {
   if (inside) return null;
-  const end = trimEndOf(obj.a, obj.b, at);
+  const end = trimEndOf(store.solid, obj.a, obj.b, at);
   if (end === 'inside' || obj.trim?.[end]) return null;
   return end;
 }
@@ -437,7 +496,7 @@ function autoTrimAtCrossings(fresh: LineObj): void {
     if (!pointOnSegment(p, seg2[0], seg2[1])) continue;
     const at = { ...p };
     // Признак считается один раз на узел: режут обе прямые по одному правилу.
-    const inside = insideCube(at);
+    const inside = insideSolid(store.solid, at);
     const end1 = autoTrimSide(fresh, at, inside);
     const end2 = autoTrimSide(obj, at, inside);
     store.commit((d) => {
@@ -446,7 +505,7 @@ function autoTrimAtCrossings(fresh: LineObj): void {
       const other = d.objects.find((o) => o.id === obj.id);
       if (other?.kind === 'line' && end2) other.trim = { ...other.trim, [end2]: at };
       if (!d.objects.some((o) => o.kind === 'point' && eq(o.p, p, 1e-4))) {
-        d.objects.push(makePoint(d, p, faceOf(p)));
+        d.objects.push(makePoint(d, p, faceOf(store.solid, p)));
       }
     });
     // Прямая в документе теперь обрезана, поэтому её отрезок пересчитывается по
@@ -476,7 +535,7 @@ const TOOL_NEEDS: Record<Tool, number> = {
 };
 
 function snap(p: Vec3): Vec3 {
-  return state.snapEnabled ? snapToCube(p).p : p;
+  return state.snapEnabled ? snapToSolid(store.solid, p).p : p;
 }
 
 function setTool(tool: Tool): void {
@@ -516,7 +575,7 @@ function pushPending(target: Target): void {
 /**
  * Наращивание цепочки сечения. Клик по первой точке замыкает цепочку, все
  * остальные клики добавляют точку, но только если она делит грань с
- * предыдущей: ребро сечения обязано целиком лежать в грани куба.
+ * предыдущей: ребро сечения обязано целиком лежать в грани фигуры.
  */
 function pushChain(target: Target): void {
   const chain = state.pending;
@@ -543,30 +602,39 @@ function pushChain(target: Target): void {
   refresh();
 }
 
-/** Точка вне граней куба в цепочку не годится: грань нужна для проверки соседей. */
+/** Точка вне граней фигуры в цепочку не годится: грань нужна для проверки соседей. */
 function faceProblem(pt: PendingPoint): string | null {
-  if (pointFaces(pt.p).length) return null;
-  return `Точка ${pt.name} вне граней куба, цепочку из неё не собрать`;
+  if (pointFaces(store.solid, pt.p).length) return null;
+  return `Точка ${pt.name} вне граней ${solidGen(store.doc.solid)}, цепочку из неё не собрать`;
 }
 
 /**
- * Соседние точки сечения должны лежать на общей грани куба. Точка на ребре или
+ * Соседние точки сечения должны лежать на общей грани фигуры. Точка на ребре или
  * вершине принадлежит нескольким граням, поэтому проверяется пересечение
  * множеств, а не равенство одиночных индексов.
  */
 function neighbourProblem(prev: PendingPoint, next: PendingPoint): string | null {
-  const a = pointFaces(prev.p);
-  const b = pointFaces(next.p);
+  const a = pointFaces(store.solid, prev.p);
+  const b = pointFaces(store.solid, next.p);
   if (!a.length || !b.length) {
     const off = !a.length ? prev : next;
-    return `Точка ${off.name} вне граней куба, цепочку через неё вести нельзя`;
+    return `Точка ${off.name} вне граней ${solidGen(store.doc.solid)}, цепочку через неё вести нельзя`;
   }
   if (a.some((f) => b.includes(f))) return null;
-  return `У точек ${prev.name} и ${next.name} нет общей грани куба: ${prev.name} на ${faceList(a)}, а ${next.name} на ${faceList(b)}`;
+  return `У точек ${prev.name} и ${next.name} нет общей грани: ${prev.name} на ${faceList(a)}, а ${next.name} на ${faceList(b)}`;
 }
 
 function faceList(faces: number[]): string {
-  return faces.map((f) => FACE_NAMES[f]).join(' и ');
+  return faces.map(faceName).join(' и ');
+}
+
+/**
+ * Подпись грани фигуры: у куба это `x = +1`, у тетраэдра - `ABC`. Имя хранится
+ * у фигуры, а не в общем списке, иначе у фигуры с треугольными гранями в
+ * сообщении вылез бы чужой индекс.
+ */
+function faceName(index: number): string {
+  return store.solid.faces[index]?.name ?? '';
 }
 
 /**
@@ -624,7 +692,7 @@ function sourceIds(chain: PendingPoint[]): string[] {
 function commitBatch(batch: PendingPoint[]): void {
   if (state.tool === 'point') {
     store.commit((d) => {
-      const p = makePoint(d, batch[0].p, faceOf(batch[0].p));
+      const p = makePoint(d, batch[0].p, faceOf(store.solid, batch[0].p));
       d.objects.push(p);
     });
     return;
@@ -649,12 +717,12 @@ function commitBatch(batch: PendingPoint[]): void {
             d,
             batch[0].p,
             batch[1].p,
-            faceOf(batch[0].p),
+            faceOf(store.solid, batch[0].p),
             [pointNameAt(batch[0]), pointNameAt(batch[1])]
           )
         );
       } else {
-        freshLine = makeLine(d, batch[0].p, batch[1].p, faceOf(batch[0].p));
+        freshLine = makeLine(d, batch[0].p, batch[1].p, faceOf(store.solid, batch[0].p));
         d.objects.push(freshLine);
       }
     });
@@ -711,7 +779,7 @@ let flashTimer: ReturnType<typeof setTimeout>;
 
 function snapFacePoint(p: Vec3, faceIndex: number | null): Vec3 {
   if (faceIndex === null) return p;
-  return snap(projectToFaceQuad(p, faceIndex));
+  return snap(projectToFace(store.solid, p, faceIndex));
 }
 
 function pendingGroup(): THREE.Group {
@@ -758,14 +826,14 @@ canvas.addEventListener('pointerdown', (e) => {
     }
     if (!e.shiftKey) store.selectOnly([]);
   } else if (state.tool === 'trim') {
-    // Отсечение не идёт через resolveTarget: оно режет прямую, а не ставит точку.
-    const target = resolveTrimTarget();
-    if (target) applyTrim(target);
-    else flash(NO_TARGET_HINT.trim);
+    // Отсечение не идёт через resolveTarget: оно режет прямые, а не ставит точку.
+    const targets = resolveTrimTargets();
+    if (targets.length) applyTrim(targets);
+    else flash(noTargetHint('trim', store.doc.solid));
   } else {
     const target = resolveTarget();
     if (target) onTargetClick(target);
-    else flash(NO_TARGET_HINT[state.tool]);
+    else flash(noTargetHint(state.tool, store.doc.solid));
   }
   updateHover();
   refresh();
@@ -846,6 +914,11 @@ function updateToolbar(): void {
     btn.classList.toggle('active', on);
     btn.setAttribute('aria-pressed', String(on));
   }
+  for (const btn of Array.from(document.querySelectorAll<HTMLElement>('[data-solid]'))) {
+    const on = btn.dataset.solid === store.doc.solid;
+    btn.classList.toggle('active', on);
+    btn.setAttribute('aria-pressed', String(on));
+  }
   for (const id of ['#snap-toggle', '#chain-toggle']) {
     const el = $(id);
     const on = id === '#snap-toggle' ? state.snapEnabled : state.chainEnabled;
@@ -858,6 +931,55 @@ function updateToolbar(): void {
  * Справка собирается из `help.ts`, а не живёт в разметке: текст должен
  * лежать рядом с остальными строками интерфейса и проверяться одним взглядом.
  */
+/**
+ * Переключатель фигур собирается из `SOLIDS_UI` и `SOLID_ICONS`, а не пишется в
+ * разметке: список фигур, их названия и значки лежат в одном месте, иначе кнопки
+ * разошлись бы с `SOLIDS` при первой же новой фигуре.
+ *
+ * Над кнопкой только значок: четыре названия занимали пол-панели. Имя остаётся в
+ * подсказке и в `aria-label`, иначе фигура была бы немой для скринридера.
+ */
+function renderSolids(): void {
+  const box = $('#solids');
+  for (const s of SOLIDS_UI) {
+    const btn = document.createElement('button');
+    btn.className = 'action toggle solid';
+    btn.dataset.solid = s.id;
+    btn.innerHTML = SOLID_ICONS[s.id];
+    btn.title = s.title;
+    btn.setAttribute('aria-label', s.title);
+    box.append(btn);
+  }
+}
+
+/**
+ * Рейка инструментов. Кнопки порождаются здесь, а не в разметке, потому что
+ * подпись, клавиша и значок берутся из одной таблицы `TOOLS_UI` и `TOOL_ICONS`:
+ * разъехавшиеся в разметке буквы и названия читались бы как разные инструменты.
+ *
+ * Порядок внутри кнопки задан сеткой в `styles.css`: клавиша, значок, название.
+ */
+function renderTools(): void {
+  const box = $('#tools');
+  for (const t of TOOLS_UI) {
+    const btn = document.createElement('button');
+    btn.className = 'tool';
+    btn.dataset.tool = t.id;
+    btn.title = t.title;
+    btn.setAttribute('aria-label', `${t.key} - ${t.title}`);
+    const key = document.createElement('b');
+    key.textContent = t.key;
+    const icon = document.createElement('span');
+    icon.className = 'tool-icon';
+    icon.innerHTML = TOOL_ICONS[t.id];
+    const title = document.createElement('span');
+    title.className = 'tool-title';
+    title.textContent = t.title;
+    btn.append(key, icon, title);
+    box.append(btn);
+  }
+}
+
 function renderHelp(): void {
   const list = $<HTMLDListElement>('#help-list');
   for (const row of [...HELP_TOOLS, ...HELP_VIEW]) {
@@ -877,7 +999,7 @@ function renderObjectList(): void {
   if (!store.doc.objects.length) {
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.textContent = 'Пока пусто. Выберите инструмент и кликайте по граням куба.';
+    empty.textContent = `Пока пусто. Выберите инструмент и кликайте по граням ${solidGen(store.doc.solid)}.`;
     list.append(empty);
     return;
   }
@@ -917,10 +1039,10 @@ function renderObjectList(): void {
     const del = document.createElement('button');
     del.className = 'mini danger';
     del.innerHTML = ICON_CROSS;
-    // Угол куба неудаляем: кнопка остаётся видимой, но неактивной, иначе
+    // Угол фигуры неудаляем: кнопка остаётся видимой, но неактивной, иначе
     // непонятно, почему нажатие ничего не делает.
     del.disabled = !!obj.fixed;
-    del.title = obj.fixed ? 'Угол куба удалить нельзя' : 'Удалить';
+    del.title = obj.fixed ? `Угол ${solidGen(store.doc.solid)} удалить нельзя` : 'Удалить';
     del.setAttribute('aria-label', del.title);
     del.onclick = (e) => {
       e.stopPropagation();
@@ -962,12 +1084,12 @@ function describe(obj: SceneObj): string {
   if (obj.kind === 'line') {
     // Прямая названа строчной буквой, и по ней не видно, через какие точки
     // она проведена. Две буквы говорят больше, чем слово «прямая», а имена
-    // углов куба пользователь уже знает.
+    // углов фигуры пользователь уже знает.
     const pts = linePoints(obj);
     return pts ? `${pts[0].name}${pts[1].name}` : 'прямая';
   }
   if (obj.kind === 'segment') return `отрезок ${dist(obj.a, obj.b).toFixed(2)}`;
-  const hits = planeEdgePoints(obj.plane);
+  const hits = planeEdgePoints(store.solid, obj.plane);
   return `пересечений: ${hits.length}`;
 }
 
@@ -1024,7 +1146,7 @@ function draggedPosition(obj: SceneObj, part: string): Vec3 | null {
     if (!target) return null;
     if (obj.face === null || target.faceIndex === null) return target.p;
     // Точка остаётся на своей грани, пока курсор явно не ушёл глубже в другую,
-    // иначе перетаскивание переворачивало бы объект через весь куб.
+    // иначе перетаскивание переворачивало бы объект через всю фигуру.
     if (target.faceIndex === obj.face) return target.p;
     const here = viewer.faceDepth(target.p, obj.face);
     const there = viewer.faceDepth(target.p, target.faceIndex);
@@ -1084,26 +1206,26 @@ function renderProperties(): void {
       card.append(
         readout('Уравнение', planeEquationText(obj.plane.n, obj.plane.d)),
       );
-      const poly = sectionPolygon(obj.plane);
+      const poly = sectionPolygon(store.solid, obj.plane);
       card.append(
         readout(
           'Сечение',
           poly.length
             ? `${poly.length}-угольник, вершины ${poly.map((p) => fmt(p, 2)).join(' ')}`
-            : 'Плоскость не пересекает куб по площади',
+            : `Плоскость не пересекает ${solidGen(store.doc.solid)} по площади`,
         ),
       );
       const btn = document.createElement('button');
       btn.className = 'action';
       btn.textContent = 'Добавить точки пересечения в сцену';
       btn.onclick = () => {
-        const pts = planeEdgePoints(obj.plane);
+        const pts = planeEdgePoints(store.solid, obj.plane);
         if (!pts.length) {
           flash('Нет пересечений с рёбрами');
           return;
         }
         store.commit((d) => {
-          for (const p of pts) d.objects.push(makePoint(d, p, faceOf(p)));
+          for (const p of pts) d.objects.push(makePoint(d, p, faceOf(store.solid, p)));
         });
         flash(`Добавлено точек: ${pts.length}`);
       };
@@ -1139,7 +1261,7 @@ function nameField(obj: SceneObj): HTMLElement {
   wrap.className = 'field';
   const l = document.createElement('span');
   l.className = 'field-label';
-  l.textContent = obj.fixed ? 'Имя (угол куба)' : 'Имя';
+  l.textContent = obj.fixed ? `Имя (угол ${solidGen(store.doc.solid)})` : 'Имя';
   const input = document.createElement('input');
   input.type = 'text';
   input.className = 'name-input';
@@ -1196,7 +1318,11 @@ function vecInputs(label: string, value: Vec3, onChange: (p: Vec3) => void): HTM
 }
 
 function refresh(): void {
-  viewer.setObjectGroup(buildScene(store.doc, store.selection, viewer.clip));
+  // Фигура могла смениться и отменой, поэтому сцена приводится к ней здесь, а
+  // не только в обработчике кнопки: иначе Ctrl+Z вернул бы куб с точками
+  // тетраэдра.
+  viewer.setSolid(store.solid);
+  viewer.setObjectGroup(buildScene(store.solid, store.doc, store.selection, viewer.clip));
   viewer.setOverlay(pendingGroup());
   // setOverlay пересобирает группу, поэтому превью приходится применять заново.
   updateHover();
@@ -1219,9 +1345,36 @@ canvas.addEventListener('pointerleave', () => {
   $('#cursor-info').textContent = '';
 });
 
-for (const btn of Array.from(document.querySelectorAll<HTMLElement>('[data-tool]'))) {
-  btn.onclick = () => setTool(btn.dataset.tool as Tool);
-}
+// Обработчик один на контейнер, как у фигур: кнопки порождаются `renderTools`
+// ниже по файлу, и навешенный на них в момент запуска обработчик повис бы в
+// пустоте.
+$('#tools').addEventListener('click', (e) => {
+  const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-tool]');
+  if (btn) setTool(btn.dataset.tool as Tool);
+});
+
+/**
+ * Смена фигуры. Чертёж прежней фигуры стирается, и спрашивается об этом только
+ * когда есть что терять: углы остаются при любой фигуре, и по длине списка их
+ * наличие не видно. Незавершённый ввод сбрасывается, потому что цепочка
+ * предыдущей фигуры к новой отношения не имеет.
+ *
+ * Обработчик один на контейнер, а не на каждую кнопку: кнопки порождаются
+ * `renderSolids` ниже по файлу, и навешенный на них обработчик в момент запуска
+ * повис бы в пустоте.
+ */
+$('#solids').addEventListener('click', (e) => {
+  const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-solid]');
+  if (!btn) return;
+  const id = btn.dataset.solid as SolidId;
+  if (id === store.doc.solid) return;
+  if (store.hasContent() && !confirm('Сменить фигуру? Чертёж будет очищен.')) return;
+  store.setSolid(id);
+  state.pending = [];
+  syncPending();
+  setTool('select');
+  viewer.fit();
+});
 
 $('#snap-toggle').onclick = () => {
   state.snapEnabled = !state.snapEnabled;
@@ -1241,7 +1394,7 @@ $('#chain-toggle').onclick = () => {
 $('#undo').onclick = () => store.undo();
 $('#redo').onclick = () => store.redo();
 $('#clear').onclick = () => {
-  // Подтверждение спрашивают только когда есть что стирать: восемь углов куба
+  // Подтверждение спрашивают только когда есть что стирать: углы фигуры
   // переживают очистку, и по длине списка это не видно.
   if (store.hasContent() && confirm('Очистить всю сцену?')) {
     store.clear();
@@ -1256,12 +1409,9 @@ $('#cancel').onclick = () => {
 $('#delete-selected').onclick = () => {
   if (store.selection.length) store.remove(store.selection);
 };
-$('#fit').onclick = () => {
-  viewer.camera.position.set(3.2, 2.6, 3.6);
-  viewer.controls.target.set(0, 0, 0);
-  viewer.controls.update();
-  viewer.requestRender();
-};
+// Положение камеры живёт в `Viewer.fit`, а не здесь: смена фигуры ставит вид так
+// же, как кнопка, и две копии одного расчёта разошлись бы с фигурой.
+$('#fit').onclick = () => viewer.fit();
 
 // Справка живёт в отдельном окне и держится, пока его не закрыли: список
 // управления длинный, а мигающая подсказка в углу сцены для него не годится.
@@ -1271,15 +1421,11 @@ $('#help-close').onclick = () => help.close();
 
 // Клавиши инструментов различаем по физическому коду, а не по букве: `e.key`
 // отдаёт символ текущей раскладки, и при русской Q, W, E печатали бы «й», «ц»,
-// «у». Клавиши подписаны латиницей, значит и набирать их надо латиницей.
-const TOOL_KEYS: Record<string, Tool> = {
-  KeyQ: 'select',
-  KeyW: 'point',
-  KeyE: 'line',
-  KeyR: 'segment',
-  KeyT: 'plane',
-  KeyY: 'trim',
-};
+// «у». Клавиши подписаны латиницей, значит и набирать их надо латиницей. Сама
+// раскладка выводится из `TOOLS_UI`, поэтому буква в рейке и здесь не разойдутся.
+const TOOL_KEYS: Record<string, Tool> = Object.fromEntries(
+  TOOLS_UI.map((t) => [`Key${t.key}`, t.id])
+);
 
 window.addEventListener('keydown', (e) => {
   const target = e.target as HTMLElement | null;
@@ -1323,30 +1469,46 @@ window.addEventListener('resize', () => {
   viewer.start();
 });
 
+/**
+ * Демо-заготовка: плоскость через начало координат с нормалью, своей у каждой
+ * фигуры, и точки её пересечения с рёбрами. Точки берутся из той же геометрии,
+ * что и любой чертёж, поэтому демо не может разойтись с правилами: у фигуры,
+ * для которой нормаль даёт меньше трёх пересечений, сечение не появится.
+ */
 $('#demo').onclick = () => {
-  const pl = planeFromPoints(DEMO_PLANE[0], DEMO_PLANE[1], DEMO_PLANE[2]);
-  if (!pl) return;
+  const solid = store.solid;
+  const n = norm(DEMO_NORMAL[store.doc.solid]);
+  if (!n) return;
+  const pl: Plane = { n, d: 0 };
+  const pts = sectionPolygon(solid, pl);
+  if (pts.length < 3) {
+    flash(`Плоскость не пересекает ${solidGen(store.doc.solid)} по площади`);
+    return;
+  }
   store.commit((d) => {
     // Имена берутся у только что созданных точек: иначе плоскость получила бы
     // имя из пустого списка.
-    const names = DEMO_PLANE.map((p) => {
-      const obj = makePoint(d, p, faceOf(p));
+    const names = pts.map((p) => {
+      const obj = makePoint(d, p, faceOf(solid, p));
       d.objects.push(obj);
       return obj.name;
     });
     d.objects.push(makePlane(d, pl, [], names));
   });
   setTool('select');
-  flash(DEMO.done);
+  flash(DEMO.done(pts.length));
 };
 
 store.subscribe(() => refresh());
+renderSolids();
+renderTools();
 renderHelp();
-// Углы куба создаются при старте: они задают систему координат и служат
+// Углы фигуры создаются при старте: они задают систему координат и служат
 // точками привязки для прямых и плоскостей.
-store.commit((d) => addCorners(d), { history: false });
+store.commit((d) => addCorners(d, store.solid), { history: false });
 setTool('select');
 syncPending();
+viewer.fit();
 // Отладочный доступ для скриптов в tmp/: поля лежат на window и ни на что в
 // приложении не влияют.
 (window as unknown as Record<string, unknown>).__viewer = viewer;
