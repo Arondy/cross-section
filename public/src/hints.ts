@@ -89,6 +89,19 @@ export function solidFaultHint(fault: SolidFault): string {
 }
 
 /** Что сказать, когда под курсором нет цели для инструмента. */
+/**
+ * Что сказать, когда сдвиг точки унёс построенную по ней плоскость.
+ *
+ * Плоскость исчезает сама, и без объяснения человек искал бы её в списке или
+ * решил, что потерял. Называем и плоскость, и точку, по которой она строилась.
+ */
+export function planeDroppedHint(names: string[]): string {
+  if (names.length === 1) {
+    return `Плоскость ${names[0]} удалена: она построена по точкам, которые сдвинулись. Постройте её заново`;
+  }
+  return `Плоскости ${names.join(', ')} удалены: они построены по точкам, которые сдвинулись. Постройте их заново`;
+}
+
 export function noTargetHint(tool: Tool, solid: SolidId): string {
   const hints: Record<Tool, string> = {
     select: '',

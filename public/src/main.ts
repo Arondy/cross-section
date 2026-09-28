@@ -35,7 +35,7 @@ function refresh(): void {
   // не только в обработчике кнопки: иначе Ctrl+Z вернул бы куб с точками
   // тетраэдра.
   viewer.setSolid(store.solid);
-  viewer.setObjectGroup(buildScene(store.solid, store.doc, store.selection, viewer.clip));
+  viewer.setObjectGroup(buildScene(store.solid, store.doc, store.selection));
   viewer.setOverlay(
     buildPendingOverlay(
       state.pending.map((pt) => pt.p),
@@ -54,6 +54,10 @@ function refresh(): void {
 function setTool(tool: Tool): void {
   state.tool = tool;
   state.pending = [];
+  // Выбор сбрасывается вместе с инструментом: поднятая точка принадлежит
+  // инструменту «Выбор», и в панели свойств она оставалась бы жить при
+  // «Отсечении» или «Плоскости», где клик по ней значит совсем другое.
+  store.selectOnly([]);
   syncPending();
   updateToolbar();
   updateHover();

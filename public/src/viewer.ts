@@ -1,4 +1,4 @@
-import * as THREE from 'three';
+﻿import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import {
   DEFAULT_SOLID,
@@ -39,7 +39,6 @@ export class Viewer {
   private gridGroup = new THREE.Group();
   objectsGroup = new THREE.Group();
   overlayGroup = new THREE.Group();
-  private clipPlanes: THREE.Plane[] = [];
   private frustum = new THREE.Frustum();
   private viewMatrix = new THREE.Matrix4();
   private spaces: HalfSpace[] = Array.from({ length: FRUSTUM_PLANES }, () => ({
@@ -146,22 +145,6 @@ export class Viewer {
     this.needsRender = true;
   }
 
-  /**
-   * Плоскости граней фигуры: по ним плоскость сечения обрезается по фигуре.
-   *
-   * `THREE.Plane` держит ту сторону, где `dot(n, p) + constant >= 0`, поэтому
-   * наружу смотрящая нормаль грани входит с минусом: полупространство должно
-   * остаться внутри фигуры, а не снаружи.
-   */
-  get clip(): THREE.Plane[] {
-    if (!this.clipPlanes.length) {
-      this.clipPlanes = this.solid.faces.map(
-        (f) => new THREE.Plane(toV(mul(f.normal, -1)), f.d)
-      );
-    }
-    return this.clipPlanes;
-  }
-
   private buildAxes(): THREE.Group {
     const g = new THREE.Group();
     const defs: { dir: Vec3; color: number; label: string }[] = [
@@ -233,7 +216,6 @@ export class Viewer {
     disposeTree(this.solidGroup);
     this.solidGroup = new THREE.Group();
     this.scene.add(this.solidGroup);
-    this.clipPlanes = [];
     this.faceMeshes = [];
     this.highlightIndex = null;
     this.buildSolid();
@@ -249,8 +231,9 @@ export class Viewer {
   }
 
   /**
-   * Каркас и грани фигуры. Грань рисуется веером треугольников от первой
-   * вершины: у куба это два треугольника, у тетраэдра один, и тот же код
+   * Сетка притяжения пересобирается вместе с фигурой: сдвинутый угол меняет
+   * габарит, и сетка прежнего размера уезжала бы за пределы куба. Показана она
+   * только пока человек тянет с зажатым Shift, поэтому видимость переносится на
    * покрывает оба случая.
    */
   private buildSolid(): void {

@@ -23,7 +23,14 @@ export type ToolState = {
   snapEnabled: boolean;
   chainEnabled: boolean;
   stickRadius: number;
-  drag: null | { id: string; part: string; moved: boolean; refused: boolean };
+  drag: null | {
+    id: string;
+    part: string;
+    moved: boolean;
+    refused: boolean;
+    /** Сказано ли уже про унесённую сдвигом плоскость: за сдвиг - один раз. */
+    told: boolean;
+  };
   hoverInfo: string;
 };
 

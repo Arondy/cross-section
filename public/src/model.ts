@@ -239,6 +239,37 @@ export function makePlane(
   };
 }
 
+/**
+ * Итог сдвига точки: отказ фигуры и имена плоскостей, которые пришлось убрать.
+ *
+ * Отказ и удаление ездят вместе по одной причине: и то и другое человек
+ * должен увидеть сразу, а не догадываться по молчаливому исчезновению плоскости
+ * из списка.
+ */
+export type PointMove = { fault: SolidFault | null; dropped: string[] };
+
+/**
+ * Плоскости, построенные по точке. Её уравнение задано тремя точками, и после
+ * сдвига оно им больше не соответствует: сечение по такой плоскости считается
+ * по несуществующей плоскости. Поэтому плоскость убирается, а не остаётся
+ * висеть с прежним уравнением.
+ *
+ * Условие в `filter` описывает, что ОСТАЁТСЯ, поэтому удаляемые плоскости
+ * здесь отбрасываются. Имена собираются попутно, чтобы вызывающий мог сказать,
+ * что исчезло.
+ */
+function dropPlanesThrough(d: Doc, pointId: string): string[] {
+  const dropped: string[] = [];
+  d.objects = d.objects.filter((o) => {
+    if (o.kind === 'plane' && o.sourceIds.includes(pointId)) {
+      dropped.push(o.name);
+      return false;
+    }
+    return true;
+  });
+  return dropped;
+}
+
 type Listener = (doc: Doc) => void;
 
 export class Store {
@@ -355,7 +386,7 @@ export class Store {
 
   /**
    * Сдвиг угла фигуры. Возвращает причину отказа, если фигура из новых вершин не
-   * получилась, и `null` при удаче.
+   * получилась, и `null` при удаче, вместе с именами убранных плоскостей.
    *
    * Проверка живёт здесь, а не в обработчике: отказ не должен оставлять угол в
    * положении, из которого фигура не собирается, - иначе грани, рёбра и сечение
@@ -363,15 +394,36 @@ export class Store {
    * пересборкой, иначе на одно перетаскивание вышло бы два шага отмены: сначала
    * сдвиг, потом возврат.
    */
-  moveCorner(id: string, p: Vec3, opts: { history?: boolean } = {}): SolidFault | null {
+  moveCorner(id: string, p: Vec3, opts: { history?: boolean } = {}): PointMove {
     const obj = this.get(id);
-    if (!obj || obj.kind !== 'point' || obj.corner === undefined) return null;
+    if (!obj || obj.kind !== 'point' || obj.corner === undefined) {
+      return { fault: null, dropped: [] };
+    }
     const fit = reshapeSolid(SOLIDS[this.doc.solid], this.movedCorner(obj.corner, p));
-    if (!fit.ok) return fit.fault;
-    this.update(id, (o) => {
-      if (o.kind === 'point') o.p = clone(p);
+    if (!fit.ok) return { fault: fit.fault, dropped: [] };
+    return this.movePoint(id, p, opts);
+  }
+
+  /**
+   * Сдвиг точки. Плоскости, построенные по ней, убираются: сдвинутая точка
+   * больше не лежит на своей плоскости, и оставленная плоскость считала бы
+   * сечение по несуществующему чертежу.
+   *
+   * Сдвиг и удаление идут одним `commit`: иначе на одно перетаскивание вышло бы
+   * два шага отмены, а отмена удаления вернула бы плоскость по уже сдвинутой
+   * точке, то есть ровно то странное состояние, ради которого плоскость и
+   * убирали.
+   */
+  movePoint(id: string, p: Vec3, opts: { history?: boolean } = {}): PointMove {
+    const dropped: string[] = [];
+    this.commit((d) => {
+      const obj = d.objects.find((o) => o.id === id);
+      if (obj?.kind === 'point') obj.p = clone(p);
+      dropped.push(...dropPlanesThrough(d, id));
     }, opts);
-    return null;
+    // Выбор чистится после правки: убранная плоскость в нём остаться не должна.
+    this.selection = this.selection.filter((s) => this.get(s));
+    return { fault: null, dropped };
   }
 
   /** Вершины фигуры, где указанной подставлено новое положение. */

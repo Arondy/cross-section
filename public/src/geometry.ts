@@ -587,6 +587,27 @@ export function faceOf(solid: Solid, p: Vec3, eps = 1e-4): number | null {
 }
 
 /**
+ * Насколько грань отстоит от своей плоскости собственными вершинами.
+ *
+ * Сдвинутый угол делает грань некомпланарной, а плоскость у неё одна на всех:
+ * `buildSolid` берёт её по трём вершинам из четырёх, и оставшаяся из плоскости
+ * выходит. Точка на нарисованной грани оказывается по другую сторону этой
+ * плоскости, и проверка «внутри ли фигура» отвергала её - сечение через такую
+ * точку построить было нельзя. Поэтому каждой грани разрешается отклонение,
+ * равное её собственному разбросу вершин.
+ *
+ * У куба, параллелепипеда и тетраэдра разброс нулевой, и проверка остаётся
+ * прежней: точка на продолжении грани за пределами фигуры по-прежнему отвергается.
+ */
+function faceSlack(solid: Solid, f: SolidFace): number {
+  let out = 0;
+  for (const i of f.poly) {
+    out = Math.max(out, Math.abs(dot(f.normal, solid.vertices[i]) - f.d));
+  }
+  return out;
+}
+
+/**
  * Внутри ли точка фигуры, включая грани, рёбра и вершины.
  *
  * Проверяются все грани, а не координаты по модулю: у наклонного
@@ -594,7 +615,7 @@ export function faceOf(solid: Solid, p: Vec3, eps = 1e-4): number | null {
  * «минус один» для них ничего не значит.
  */
 export function insideSolid(solid: Solid, p: Vec3, eps = 1e-4): boolean {
-  return solid.faces.every((f) => dot(f.normal, p) - f.d <= eps);
+  return solid.faces.every((f) => dot(f.normal, p) - f.d <= faceSlack(solid, f) + eps);
 }
 
 /**
@@ -628,6 +649,50 @@ export function projectToFace(solid: Solid, p: Vec3, faceIndex: number): Vec3 {
 }
 
 export type SnapKind = 'none' | 'edge' | 'vertex';
+
+/**
+ * Шаг сетки притяжения: столько же, сколько делений у сетки на полу. Привязка
+ * невидима, если её шаг не совпадает с нарисованной сеткой, и выглядит так,
+ * будто точки прыгают сами.
+ */
+export const GRID_STEP = 0.2;
+/** Ближайший узел сетки по каждой координате. */
+export function snapToGrid(p: Vec3, step = GRID_STEP): Vec3 {
+  const near = (n: number) => Math.round(n / step) * step;
+  return v3(near(p.x), near(p.y), near(p.z));
+}
+
+/**
+ * Узел сетки на грани фигуры.
+ *
+ * Привязываются только координаты вдоль грани, а та, что лежит по её нормали,
+ * выводится из плоскости. Иначе сдвиг по сетке увёл бы точку с грани, а у
+ * наклонной грани тетраэдра или наклонного параллелепипеда она вообще ушла бы
+ * внутрь фигуры, и дальше по точке нечего было бы построить.
+ *
+ * Узел сетки общий для всей фигуры, а грань - её часть, поэтому узел может
+ * выпасть за многоугольник грани. Такую точку обязательно прижимаем внутрь, как
+ * это делает `snapFacePoint` при свободном сдвиге: точка вне граней не
+ * принадлежит ни одной из них, и цепочку сечения через неё вести нельзя.
+ */
+export function snapToGridOnFace(
+  solid: Solid,
+  p: Vec3,
+  faceIndex: number,
+  step = GRID_STEP
+): Vec3 {
+  const f = solid.faces[faceIndex];
+  const n = [f.normal.x, f.normal.y, f.normal.z];
+  const abs = n.map(Math.abs);
+  // Ось по нормали - та, где модуль компоненты наибольший: нулевой у грани не
+  // бывает, иначе грань выродилась бы в прямую.
+  const k = abs[0] >= abs[1] && abs[0] >= abs[2] ? 0 : abs[1] >= abs[2] ? 1 : 2;
+  const q = snapToGrid(p, step);
+  const at = [q.x, q.y, q.z];
+  const rest = n[0] * at[0] + n[1] * at[1] + n[2] * at[2] - n[k] * at[k];
+  at[k] = (f.d - rest) / n[k];
+  return projectToFace(solid, v3(at[0], at[1], at[2]), faceIndex);
+}
 
 export function snapToSolid(
   solid: Solid,

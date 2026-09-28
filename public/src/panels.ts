@@ -17,7 +17,7 @@ import {
   type Vec3,
 } from './geometry';
 import { makePoint, type LineObj, type PointObj, type SceneObj } from './model';
-import { solidFaultHint, solidGen } from './hints';
+import { planeDroppedHint, solidFaultHint, solidGen } from './hints';
 import { ICON_CROSS, ICON_EYE } from './icons';
 import { $, flash, state, store } from './app';
 import { autoTrimAtCrossings, clearTrimEnd } from './targets';
@@ -96,7 +96,7 @@ export function renderObjectList(): void {
       e.stopPropagation();
       store.remove([obj.id]);
     };
-    row.onclick = (e) => store.toggleSelect(obj.id, e.shiftKey);
+    row.onclick = (e) => store.toggleSelect(obj.id, e.ctrlKey || e.metaKey);
     // Двойной клик выбирает объект и ставит курсор в поле имени. Фокус сразу,
     // без отложенного кадра: перерисовка панели успевает заменить поле.
     row.ondblclick = (e) => {
@@ -204,11 +204,8 @@ function planeEquationText(n: Vec3, d: number): string {
 }
 
 /** Правка положения обычной точки. Фигура от неё не зависит, отказа не бывает. */
-function movePoint(id: string, p: Vec3): SolidFault | null {
-  store.update(id, (o) => {
-    if (o.kind === 'point') o.p = p;
-  });
-  return null;
+function movePoint(id: string, p: Vec3): string[] {
+  return store.movePoint(id, p).dropped;
 }
 
 export function renderProperties(): void {
@@ -228,15 +225,16 @@ export function renderProperties(): void {
       // свойства не должны быть путём, где проверки фигуры нет.
       card.append(
         vecInputs(obj.fixed ? 'Положение угла' : 'Координаты', obj.p, (p) => {
-          const fault = obj.fixed
+          const { fault, dropped } = obj.fixed
             ? store.moveCorner(obj.id, p)
-            : movePoint(obj.id, p);
+            : { fault: null as SolidFault | null, dropped: movePoint(obj.id, p) };
           if (fault) {
             // Отказ возвращает полю прежнее число: иначе введённое значение
             // осталось бы стоять в поле, хотя на сцене угол не сдвинулся.
             flash(solidFaultHint(fault));
             renderProperties();
           }
+          if (dropped.length) flash(planeDroppedHint(dropped));
         })
       );
     } else if (obj.kind === 'line' || obj.kind === 'segment') {

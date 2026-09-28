@@ -1,9 +1,13 @@
-import * as THREE from 'three';
+﻿import * as THREE from 'three';
 import {
+  cross,
+  dot,
   lineFromPoints,
+  norm,
   planeAxes,
   planeEdgePoints,
   sectionPolygon,
+  sub,
   v3,
   type Plane,
   type Solid,
@@ -150,24 +154,28 @@ function planeBasis(pl: Plane): { origin: THREE.Vector3; u: THREE.Vector3; w: TH
 }
 
 /**
- * Отсекающие плоскости, совпадающие с самой плоскостью объекта, убираются.
+ * Полупространства сторон сечения, ими обрезается лист плоскости.
  *
- * Лист обрезается полупространствами граней фигуры, а при совпадении с гранью
- * расстояние до её clip-плоскости равно нулю: фрагменты по краю случайно то
- * режутся, то нет, и плоскость покрывается крапом, хотя сечение построено
- * верно. Остальные полупространства лист по-прежнему держат в габарите
- * фигуры, поэтому он не выходит за пределы.
+ * Резать лист полупространствами граней было бы логично, но неверно: сдвинутый
+ * угол делает грань некомпланарной, и плоскость, взятая по трём вершинам из
+ * четырёх, описывает уже не её. Например у куба с уведённой `D₁` грань `DAA₁D₁`
+ * сохраняет подпись `x = −1` и держит лист по старой грани, а сечение уходило
+ * левее `DD₁`. Стороны сечения считаются по настоящим рёбрам, поэтому обрезают
+ * лист ровно по видимому контуру.
+ *
+ * Обход сечения идёт против часовой стрелки относительно нормали, так что
+ * внутренняя нормаль стороны - поворот нормали на её направление.
  */
-function clipForPlane(pl: Plane, clip: THREE.Plane[]): THREE.Plane[] {
-  const n = toV(pl.n);
-  return clip.filter((cp) => {
-    const k = cp.normal.dot(n);
-    if (Math.abs(Math.abs(k) - 1) > 1e-3) return true;
-    // Грань, параллельная плоскости, лежит на ней, только если её знак
-    // совпадает: иначе это грань с противоположной стороны фигуры.
-    const s = k > 0 ? pl.d : -pl.d;
-    return Math.abs(s + cp.constant) > 1e-3;
-  });
+function clipForSection(poly: Vec3[], pl: Plane): THREE.Plane[] {
+  const out: THREE.Plane[] = [];
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const inward = norm(cross(pl.n, sub(b, a)));
+    if (!inward) continue;
+    out.push(new THREE.Plane(toV(inward), -dot(inward, a)));
+  }
+  return out;
 }
 
 /**
@@ -180,44 +188,42 @@ function sheetRadius(solid: Solid): number {
   return Math.max(...solid.vertices.map((p) => Math.hypot(p.x, p.y, p.z))) * 1.1;
 }
 
-function buildPlane(
-  solid: Solid,
-  obj: PlaneObj,
-  index: number,
-  selected: boolean,
-  clip: THREE.Plane[]
-): THREE.Group {
+function buildPlane(solid: Solid, obj: PlaneObj, index: number, selected: boolean): THREE.Group {
   const g = new THREE.Group();
   const color = pickColor(PALETTE.plane, index);
   const poly = sectionPolygon(solid, obj.plane);
   const { origin, u, w } = planeBasis(obj.plane);
 
   const size = sheetRadius(solid);
-  const sheet = new THREE.Mesh(
-    new THREE.PlaneGeometry(size * 2, size * 2),
-    new THREE.MeshBasicMaterial({
-      color,
-      transparent: true,
-      opacity: selected ? 0.22 : 0.14,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-      // Плоскость, совпавшая с гранью, идёт ровно по её поверхности. Смещение
-      // в сторону камеры убирает спор двух поверхностей в буфере глубины: без
-      // него грань местами перехватывает лист, и та же самая плоскость
-      // выглядит то своей, то чужой.
-      polygonOffset: true,
-      polygonOffsetFactor: -1,
-      polygonOffsetUnits: -2,
-      clippingPlanes: clipForPlane(obj.plane, clip),
-      clipIntersection: false,
-    })
-  );
-  sheet.quaternion.setFromRotationMatrix(
-    new THREE.Matrix4().makeBasis(u, w, toV(obj.plane.n))
-  );
-  sheet.position.copy(origin);
-  sheet.renderOrder = 3;
-  g.add(tag(obj, sheet, 'sheet', false));
+  // Листа нет, пока нет сечения: обрезать его нечем, а незамеченный квадрат
+  // светился бы поверх фигуры там, где плоскость с ней не пересекается.
+  if (poly.length >= 3) {
+    const sheet = new THREE.Mesh(
+      new THREE.PlaneGeometry(size * 2, size * 2),
+      new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: selected ? 0.22 : 0.14,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        // Плоскость, совпавшая с гранью, идёт ровно по её поверхности. Смещение
+        // в сторону камеры убирает спор двух поверхностей в буфере глубины: без
+        // него грань местами перехватывает лист, и та же самая плоскость
+        // выглядит то своей, то чужой.
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -2,
+        clippingPlanes: clipForSection(poly, obj.plane),
+        clipIntersection: false,
+      })
+    );
+    sheet.quaternion.setFromRotationMatrix(
+      new THREE.Matrix4().makeBasis(u, w, toV(obj.plane.n))
+    );
+    sheet.position.copy(origin);
+    sheet.renderOrder = 3;
+    g.add(tag(obj, sheet, 'sheet', false));
+  }
 
   if (poly.length >= 3) {
     const verts: number[] = [];
@@ -386,12 +392,7 @@ export function buildPendingOverlay(points: Vec3[], chainFirst: boolean): THREE.
   return g;
 }
 
-export function buildScene(
-  solid: Solid,
-  doc: Doc,
-  selection: string[],
-  clip: THREE.Plane[]
-): THREE.Group {
+export function buildScene(solid: Solid, doc: Doc, selection: string[]): THREE.Group {
   const group = new THREE.Group();
   // Индексы нумеруют объекты каждого вида отдельно, чтобы цвета не повторялись
   // у соседей одного вида.
@@ -403,7 +404,7 @@ export function buildScene(
     if (obj.kind === 'point') group.add(buildPoint(obj, selected));
     else if (obj.kind === 'line') group.add(buildLine(obj, index, selected));
     else if (obj.kind === 'segment') group.add(buildSegment(obj, index, selected));
-    else group.add(buildPlane(solid, obj, index, selected, clip));
+    else group.add(buildPlane(solid, obj, index, selected));
   }
   return group;
 }
